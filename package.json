@@ -3,7 +3,28 @@
   "version": "1.0.0",
   "private": true,
   "description": "PowerShell in a browser tab, so it can be opened inside the Steam in-game overlay",
+  "license": "MIT",
+  "author": "Keaton Dalquist",
   "main": "server.js",
+  "keywords": [
+    "steam",
+    "steam-overlay",
+    "in-game-overlay",
+    "terminal",
+    "web-terminal",
+    "powershell",
+    "windows",
+    "conpty",
+    "node-pty",
+    "xterm",
+    "claude-code"
+  ],
+  "engines": {
+    "node": ">=18"
+  },
+  "os": [
+    "win32"
+  ],
   "scripts": {
     "start": "node server.js",
     "lan": "node server.js --lan"

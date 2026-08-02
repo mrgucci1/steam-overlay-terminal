@@ -26,6 +26,10 @@ function parseArgs(argv) {
       console.log('Usage: node client.js [--host H] [--port N] [--session NAME] [--token TOK]');
       console.log('Ctrl+] detaches without killing the shell.');
       process.exit(0);
+    } else {
+      // Silently ignoring a typo would quietly attach you to the wrong session.
+      console.error('unknown option: ' + argv[i] + '  (try --help)');
+      process.exit(1);
     }
   }
   return o;

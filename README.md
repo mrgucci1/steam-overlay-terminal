@@ -1,11 +1,17 @@
-# steam-overlay-terminal
+# steam-overlay-terminal — PowerShell in the Steam in-game overlay
 
-A real PowerShell session served as a web page, so you can open it inside the Steam
-in-game overlay and keep using Claude Code without alt-tabbing out of a game.
+**Run a real PowerShell terminal — and Claude Code — inside the Steam overlay, without
+alt-tabbing out of your game.** A Windows ConPTY session served as a local web page, so
+Shift+Tab gets you a shell instead of a browser you don't want.
 
 Steam has no API for putting an arbitrary Windows window into the overlay — the only
 third-party surface it exposes in-game is its built-in Chromium browser. So the trick
 is to make the terminal *be* a web page.
+
+![Three PowerShell panes and a Claude Code session running in the Steam in-game overlay during Counter-Strike 2](docs/overlay.png)
+
+*Three panes and a live Claude Code session in the Steam overlay, mid-match in
+Counter-Strike 2.*
 
 - Real ConPTY session via `node-pty`, so full TUIs (Claude Code, vim, fzf) work.
 - **The shell outlives the browser.** Closing the overlay, reloading the page, or
@@ -17,8 +23,11 @@ is to make the terminal *be* a web page.
 - A clickable key bar for Esc / Tab / Shift+Tab / Ctrl+C, because Steam eats
   Shift+Tab and phone keyboards have no Esc key.
 - Multiple clients can attach at once (overlay + desktop + phone).
+- Listens on loopback only unless you ask otherwise, and refuses connections from
+  other web pages — see [Security](#security).
 
-Windows only. Requires Node.js.
+**Requirements:** Windows 10 1809 or newer (ConPTY), Node.js 18+, and PowerShell —
+`pwsh.exe` if it's on your PATH, otherwise the built-in `powershell.exe`.
 
 ---
 
@@ -27,7 +36,8 @@ Windows only. Requires Node.js.
 **1. Install**
 
 ```powershell
-cd C:\Users\dalqu\Documents\Github\steam-overlay-terminal
+git clone https://github.com/YOUR-USERNAME/steam-overlay-terminal.git
+cd steam-overlay-terminal
 npm install
 ```
 
@@ -56,7 +66,7 @@ where you left off.
 
 ---
 
-## Split panes
+## Split panes, like Windows Terminal
 
 Same bindings as Windows Terminal:
 
@@ -79,7 +89,7 @@ intercepted.
 
 ---
 
-## Working in the same session from your desktop
+## Share one shell between the overlay and Windows Terminal
 
 Don't run `claude` in a separate PowerShell window — run it *inside* the shared
 session, so the overlay shows the work you were already doing:
@@ -101,7 +111,7 @@ Claude Code sessions are portable: start `client.js` (or open the overlay) and r
 
 ---
 
-## From your phone or tablet
+## From your phone or tablet, over your LAN
 
 Often nicer than typing into a game overlay:
 
@@ -112,23 +122,51 @@ node server.js --lan
 This also listens on your LAN IP and prints a URL like
 `http://192.168.1.42:7681/?t=<token>`. Open that on any device on your network.
 
-The token is generated once and saved to `.token`, so the URL is stable and works
-as a bookmark. **Anyone on your network with that token gets a shell on this
-machine — don't port-forward it.**
+The token is generated once and saved to `.token` (gitignored), so the URL is
+stable and works as a bookmark. **Anyone on your network with that token gets a
+shell on this machine — don't port-forward it.**
+
+---
+
+## Security
+
+This process hands out shells, so it's worth being explicit about what protects
+one.
+
+- **Loopback by default.** Without `--lan` the server binds `127.0.0.1`, so
+  nothing off this machine can reach it at all.
+- **Other web pages can't use it.** A WebSocket handshake is exempt from the
+  same-origin policy, so any site you had open could otherwise connect to
+  `ws://127.0.0.1:7681/ws` and type into your shell. The server rejects any
+  handshake whose `Origin` isn't the page it served itself. Non-browser clients
+  like `client.js` send no `Origin` at all, which is how they're told apart.
+- **DNS rebinding is blocked too.** When no token is in play, requests must
+  arrive addressed to a loopback name; a rebinding page always arrives under its
+  own hostname. Use `--allow-host` if you reach the server by some other name.
+- **`--lan` requires a token**, compared in constant time, and it's the only
+  thing standing between your LAN and a shell. It travels in the URL over plain
+  HTTP, so treat it as LAN-only: no HTTPS, no port forwarding, no public tunnel.
+- **No sandbox.** The shell runs as you, with your profile and your privileges.
+  That's the point of the tool, but it means the trust boundary is the machine.
+
+Found something? Open an issue — please don't include your `.token`.
 
 ---
 
 ## Options
 
 ```powershell
-node server.js --port 7681      # change port (default 7681)
-node server.js --lan            # listen on LAN too; requires a token
-node server.js --cwd C:\Users\dalqu\Documents\Github   # shell start directory
-node server.js --shell powershell.exe                  # default: pwsh.exe
+node server.js --port 7681          # change port (default 7681)
+node server.js --lan                # listen on LAN too; requires a token
+node server.js --cwd C:\src\myrepo  # shell start directory
+node server.js --shell powershell.exe   # default: pwsh.exe if on PATH, else powershell.exe
+node server.js --token <str>        # set the LAN token instead of the generated one
+node server.js --allow-host term.local  # extra hostname the browser may use (repeatable)
 
-node client.js --port 7681      # match a non-default server port
-node client.js --session build  # a second, independent shell
-node client.js --token <tok>    # needed when the server runs with --lan
+node client.js --host 127.0.0.1     # server address (default 127.0.0.1)
+node client.js --port 7681          # match a non-default server port
+node client.js --session build      # a second, independent shell
+node client.js --token <tok>        # needed when the server runs with --lan
 ```
 
 Web URL parameters:
@@ -141,21 +179,25 @@ Web URL parameters:
 
 ---
 
-## If the overlay browser won't load the page
+## Troubleshooting: the overlay browser won't load the page
 
-The overlay runs an older Chromium build, and some users report loopback addresses
-failing in it. In order of effort:
+`http://127.0.0.1:7681/` loads in the overlay browser — that's what the screenshot
+above is. If yours doesn't, the overlay runs an older Chromium build and some users
+report loopback addresses failing in it. In order of effort:
 
 1. Use `http://127.0.0.1:7681/` rather than `http://localhost:7681/`.
 2. Run with `--lan` and use the printed LAN IP. A routable address sidesteps
    loopback handling entirely.
-3. Add `127.0.0.1  term.local` to `C:\Windows\System32\drivers\etc\hosts` and
-   browse to `http://term.local:7681/`.
+3. Add `127.0.0.1  term.local` to `C:\Windows\System32\drivers\etc\hosts`, start
+   the server with `--allow-host term.local`, and browse to
+   `http://term.local:7681/`.
 
 ---
 
 ## Notes and limitations
 
+- Tested in Counter-Strike 2 (the screenshot above). Any game with the Steam overlay
+  enabled should behave the same.
 - Exclusive-fullscreen games work — that's the main advantage over an always-on-top
   terminal window, which exclusive fullscreen hides.
 - Some games grab the mouse aggressively. The overlay usually still takes focus,
@@ -164,11 +206,17 @@ failing in it. In order of effort:
   in the session. Use `--shell` or edit your profile if that's a problem.
 - Sessions live in server memory. Restarting `server.js` ends them.
 - Scrollback replay is capped at 512 KB per session.
+- Windows only. The pty layer is ConPTY, and the whole point is the Windows shell
+  you already use.
 
-## How it works
+## How it works: ConPTY, node-pty, and xterm.js
 
 `server.js` spawns PowerShell in a ConPTY via `node-pty` and keeps it alive
 independently of any viewer. Browsers connect over WebSocket to an xterm.js page;
 `client.js` connects to the same WebSocket and pipes it through your terminal's
 stdio in raw mode. Output is fanned out to every attached client and buffered for
 replay, so attaching and detaching is lossless.
+
+## License
+
+MIT — see [LICENSE](LICENSE). Not affiliated with Valve or Anthropic.

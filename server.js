@@ -19,7 +19,7 @@ const ROOT = __dirname;
 // ---------------------------------------------------------------- args
 
 function parseArgs(argv) {
-  const opts = { port: 7681, lan: false, cwd: null, shell: null, token: null };
+  const opts = { port: 7681, lan: false, cwd: null, shell: null, token: null, allowHosts: [] };
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i];
     if (a === '--lan') opts.lan = true;
@@ -27,16 +27,28 @@ function parseArgs(argv) {
     else if (a === '--cwd') opts.cwd = argv[++i];
     else if (a === '--shell') opts.shell = argv[++i];
     else if (a === '--token') opts.token = argv[++i];
+    else if (a === '--allow-host') opts.allowHosts.push(String(argv[++i]).toLowerCase());
     else if (a === '--help' || a === '-h') {
       console.log(
-        'Usage: node server.js [--port 7681] [--lan] [--cwd <dir>] [--shell <exe>] [--token <str>]\n\n' +
-          '  --lan     bind 0.0.0.0 so phones/tablets and the overlay can reach it by LAN IP\n' +
-          '            (a token is required in this mode; one is generated and persisted)\n' +
-          '  --cwd     starting directory for the shell\n' +
-          '  --shell   shell executable (default: pwsh.exe, falling back to powershell.exe)'
+        'Usage: node server.js [--port 7681] [--lan] [--cwd <dir>] [--shell <exe>]\n' +
+          '                     [--token <str>] [--allow-host <name>]\n\n' +
+          '  --lan          bind 0.0.0.0 so phones/tablets and the overlay can reach it by LAN IP\n' +
+          '                 (a token is required in this mode; one is generated and persisted)\n' +
+          '  --cwd          starting directory for the shell\n' +
+          '  --shell        shell executable (default: pwsh.exe, falling back to powershell.exe)\n' +
+          '  --token        set the LAN token instead of using the generated one\n' +
+          '  --allow-host   extra hostname the browser may reach this server by, e.g. a\n' +
+          '                 hosts-file alias (repeatable)'
       );
       process.exit(0);
+    } else {
+      console.error(`unknown option: ${a}  (try --help)`);
+      process.exit(1);
     }
+  }
+  if (!Number.isInteger(opts.port) || opts.port < 1 || opts.port > 65535) {
+    console.error('--port must be a number between 1 and 65535');
+    process.exit(1);
   }
   return opts;
 }
@@ -68,8 +80,40 @@ if (opts.lan) {
   }
 }
 
-function authorized(url) {
-  return !TOKEN || url.searchParams.get('t') === TOKEN;
+// ------------------------------------------------------- access control
+//
+// This process hands out shells, so two distinct attacks have to be closed.
+//
+// A WebSocket handshake is exempt from the same-origin policy. Without an
+// Origin check, any page in any open tab could connect to ws://127.0.0.1:7681
+// and type into your shell. Browsers always send Origin on a handshake;
+// client.js and other non-browser clients send none, so an absent Origin means
+// the request did not come from a web page.
+//
+// An Origin check alone does not stop DNS rebinding - such a page can serve
+// itself from the same origin it later aims at us - but it always arrives under
+// its own hostname. So when no token is in play, the Host has to be a name that
+// can only mean this machine.
+
+const LOCAL_HOSTS = new Set(['127.0.0.1', 'localhost', '::1', '[::1]', ...opts.allowHosts]);
+
+function sameSite(req) {
+  const host = (req.headers.host || '').toLowerCase();
+  if (!TOKEN && !LOCAL_HOSTS.has(host.replace(/:\d+$/, ''))) return false;
+  const origin = req.headers.origin;
+  if (!origin) return true;
+  try {
+    return new URL(origin).host.toLowerCase() === host;
+  } catch {
+    return false;
+  }
+}
+
+function tokenOk(url) {
+  if (!TOKEN) return true;
+  const got = Buffer.from(url.searchParams.get('t') || '');
+  const want = Buffer.from(TOKEN);
+  return got.length === want.length && crypto.timingSafeEqual(got, want);
 }
 
 // ------------------------------------------------------------- sessions
@@ -97,6 +141,12 @@ function getSession(name) {
     cwd: START_CWD,
     env: process.env,
     useConpty: true,
+    // node-pty's older ConPTY path forks a helper on kill() to enumerate the
+    // console process list; from a process that already owns a console (this
+    // one) that helper dies with "AttachConsole failed" and prints a stack
+    // trace to our stderr on every closed pane. The bundled conpty.dll takes a
+    // kill path with no helper. Both prebuilt arches ship the DLL.
+    useConptyDll: true,
   });
 
   // Scrollback is kept as a chunk list so trimming is O(chunk) rather than
@@ -114,6 +164,7 @@ function getSession(name) {
 
   proc.onExit(({ exitCode }) => {
     sessions.delete(name);
+    console.log(`[session] "${name}" ended (exit ${exitCode})`);
     broadcast(s, { type: 'exit', code: exitCode });
     // Otherwise the scrollback stays reachable through every attached socket's
     // handler closure for as long as that socket lives.
@@ -177,6 +228,10 @@ const server = http.createServer((req, res) => {
   const url = new URL(req.url, 'http://x');
   const entry = STATIC[url.pathname];
 
+  if (!sameSite(req)) {
+    res.writeHead(403, { 'content-type': 'text/plain' }).end('bad Host or Origin');
+    return;
+  }
   if (url.pathname === '/favicon.ico') {
     res.writeHead(204).end();
     return;
@@ -185,7 +240,7 @@ const server = http.createServer((req, res) => {
     res.writeHead(404).end('not found');
     return;
   }
-  if (entry.auth && !authorized(url)) {
+  if (entry.auth && !tokenOk(url)) {
     res.writeHead(401, { 'content-type': 'text/plain' }).end('missing or bad ?t= token');
     return;
   }
@@ -207,7 +262,7 @@ const wss = new WebSocketServer({ noServer: true });
 
 server.on('upgrade', (req, socket, head) => {
   const url = new URL(req.url, 'http://x');
-  if (url.pathname !== '/ws' || !authorized(url)) {
+  if (url.pathname !== '/ws' || !sameSite(req) || !tokenOk(url)) {
     socket.destroy();
     return;
   }
@@ -215,7 +270,17 @@ server.on('upgrade', (req, socket, head) => {
 });
 
 wss.on('connection', (ws, url) => {
-  const s = getSession(url.searchParams.get('s') || 'main');
+  let s;
+  try {
+    s = getSession(url.searchParams.get('s') || 'main');
+  } catch (err) {
+    // A bad --shell shouldn't take the server down with a stack trace; show the
+    // reason in the pane that asked for it.
+    console.error(`[session] failed to spawn ${SHELL}: ${err.message}`);
+    ws.send(JSON.stringify({ type: 'o', d: `failed to start ${SHELL}: ${err.message}\r\n` }));
+    ws.close();
+    return;
+  }
   s.clients.add(ws);
   console.log(`[client] attached to "${s.name}" (${s.clients.size} attached)`);
 
@@ -246,7 +311,8 @@ wss.on('connection', (ws, url) => {
 
   ws.on('close', () => {
     s.clients.delete(ws);
-    console.log(`[client] detached from "${s.name}" (${s.clients.size} attached) - shell kept alive`);
+    const fate = sessions.has(s.name) ? ' - shell kept alive' : '';
+    console.log(`[client] detached from "${s.name}" (${s.clients.size} attached)${fate}`);
   });
 });
 
@@ -263,6 +329,17 @@ function lanAddresses() {
 }
 
 const host = opts.lan ? '0.0.0.0' : '127.0.0.1';
+
+server.on('error', (err) => {
+  if (err.code === 'EADDRINUSE') {
+    console.error(`\n  port ${opts.port} is already in use - is server.js already running?`);
+    console.error('  pick another with --port.\n');
+  } else {
+    console.error(`\n  could not listen on ${host}:${opts.port} - ${err.message}\n`);
+  }
+  process.exit(1);
+});
+
 server.listen(opts.port, host, () => {
   const q = TOKEN ? `/?t=${TOKEN}` : '/';
   console.log('');
