@@ -12,6 +12,8 @@ is to make the terminal *be* a web page.
   switching devices reattaches to the same shell with its scrollback intact.
 - **Your normal terminal window can join the same session** (`client.js`), so the
   overlay is just a second view of the shell you were already using.
+- **Split panes**, like Windows Terminal — each pane is its own shell, and the
+  layout survives a page reload.
 - A clickable key bar for Esc / Tab / Shift+Tab / Ctrl+C, because Steam eats
   Shift+Tab and phone keyboards have no Esc key.
 - Multiple clients can attach at once (overlay + desktop + phone).
@@ -51,6 +53,29 @@ in-game* is on.
 **4. Use it.** Launch a game, hit your overlay key, click into the terminal, run
 `claude`. Closing the overlay does not kill anything — reopen and you're back
 where you left off.
+
+---
+
+## Split panes
+
+Same bindings as Windows Terminal:
+
+| Action | Key | Button |
+| --- | --- | --- |
+| Split right | `Alt+Shift++` | **Split →** |
+| Split down | `Alt+Shift+-` | **Split ↓** |
+| Move focus | `Alt+←↑↓→` | click a pane |
+| Close pane | `Ctrl+Shift+W` | **× Pane** |
+
+Drag the divider between panes to resize; the pty is resized to match. Every pane
+is an independent shell with its own session name, shown in the status corner.
+
+The layout is saved to `localStorage`, so reloading the page — or the overlay
+reloading it for you — brings back the same panes reattached to the same live
+shells. **Closing a pane ends that shell**; merely disconnecting never does.
+
+Use the buttons rather than the keys inside the Steam overlay if a binding gets
+intercepted.
 
 ---
 

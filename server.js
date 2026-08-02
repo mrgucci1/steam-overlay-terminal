@@ -148,6 +148,10 @@ const server = http.createServer((req, res) => {
   const pathname = req.url.split('?')[0];
   const entry = STATIC[pathname];
 
+  if (pathname === '/favicon.ico') {
+    res.writeHead(204).end();
+    return;
+  }
   if (!entry) {
     res.writeHead(404).end('not found');
     return;
@@ -200,6 +204,13 @@ wss.on('connection', (ws, req) => {
       try {
         s.proc.resize(msg.cols, msg.rows);
       } catch { /* pty may have exited */ }
+    } else if (msg.type === 'k') {
+      // Closing a pane in the UI ends that shell, the way closing a terminal
+      // pane does. Merely disconnecting never kills anything.
+      console.log(`[session] killing "${s.name}" at client request`);
+      try {
+        s.proc.kill();
+      } catch { /* already gone */ }
     }
   });
 

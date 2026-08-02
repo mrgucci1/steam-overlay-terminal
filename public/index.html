@@ -12,7 +12,21 @@
     font-family: "Cascadia Mono", Consolas, monospace;
   }
   #app { display: flex; flex-direction: column; height: 100%; }
-  #term { flex: 1 1 auto; min-height: 0; padding: 4px 6px; }
+  #panes { flex: 1 1 auto; min-height: 0; display: flex; padding: 3px; }
+
+  .pane, .split { flex: 1 1 0; min-width: 0; min-height: 0; display: flex; }
+  .split.row { flex-direction: row; }
+  .split.col { flex-direction: column; }
+
+  .pane { flex-direction: column; border: 1px solid #232323; border-radius: 3px; overflow: hidden; }
+  .pane.focused { border-color: #3b78ff; }
+  .pane-term { flex: 1 1 auto; min-height: 0; padding: 2px 4px; }
+
+  .divider { flex: 0 0 6px; background: #1a1a1a; }
+  .divider:hover, .divider.dragging { background: #3b78ff; }
+  .split.row > .divider { cursor: col-resize; }
+  .split.col > .divider { cursor: row-resize; }
+
   #bar {
     flex: 0 0 auto; display: flex; gap: 4px; align-items: center;
     padding: 4px 6px; background: #171717; border-top: 1px solid #2a2a2a;
@@ -24,6 +38,7 @@
   }
   #bar button:hover { background: #333; }
   #bar button:active { background: #444; }
+  #bar .sep { flex: 0 0 auto; width: 1px; height: 18px; background: #333; margin: 0 3px; }
   #status { margin-left: auto; padding-left: 10px; flex: 0 0 auto; }
   .ok { color: #4ec9b0; }
   .bad { color: #f48771; }
@@ -31,10 +46,10 @@
 </head>
 <body>
 <div id="app">
-  <div id="term"></div>
+  <div id="panes"></div>
   <div id="bar">
-    <!-- Steam's overlay swallows Shift+Tab, and phones have no Esc key, so the
-         keys that matter most for a TUI get clickable equivalents. -->
+    <!-- Steam's overlay swallows Shift+Tab, and phone keyboards have no Esc, so
+         the keys that matter most for a TUI get clickable equivalents. -->
     <button data-key="esc">Esc</button>
     <button data-key="tab">Tab</button>
     <button data-key="shifttab">Shift+Tab</button>
@@ -42,6 +57,10 @@
     <button data-key="up">&uarr;</button>
     <button data-key="down">&darr;</button>
     <button data-key="enter">Enter</button>
+    <span class="sep"></span>
+    <button id="split-row" title="Split right (Alt+Shift++)">Split &rarr;</button>
+    <button id="split-col" title="Split down (Alt+Shift+-)">Split &darr;</button>
+    <button id="close-pane" title="Close pane (Ctrl+Shift+W)">&times; Pane</button>
     <span id="status" class="bad">connecting...</span>
   </div>
 </div>
@@ -64,100 +83,360 @@
 
   var params = new URLSearchParams(location.search);
   var token = params.get('t') || '';
-  var session = params.get('s') || 'main';
+  var rootSession = params.get('s') || 'main';
+  var fontSize = Number(params.get('fontSize')) || 14;
+
+  var panesEl = document.getElementById('panes');
   var statusEl = document.getElementById('status');
 
-  var term = new Terminal({
-    cursorBlink: true,
-    fontFamily: '"Cascadia Mono", Consolas, "Courier New", monospace',
-    fontSize: Number(params.get('fontSize')) || 14,
-    scrollback: 10000,
-    // Default DOM renderer on purpose: the overlay browser is an older
-    // Chromium and WebGL there is not worth the risk.
-    theme: {
-      background: '#0c0c0c', foreground: '#cccccc', cursor: '#ffffff',
-      black: '#0c0c0c', red: '#c50f1f', green: '#13a10e', yellow: '#c19c00',
-      blue: '#0037da', magenta: '#881798', cyan: '#3a96dd', white: '#cccccc',
-      brightBlack: '#767676', brightRed: '#e74856', brightGreen: '#16c60c',
-      brightYellow: '#f9f1a5', brightBlue: '#3b78ff', brightMagenta: '#b4009e',
-      brightCyan: '#61d6d6', brightWhite: '#f2f2f2'
+  var THEME = {
+    background: '#0c0c0c', foreground: '#cccccc', cursor: '#ffffff',
+    black: '#0c0c0c', red: '#c50f1f', green: '#13a10e', yellow: '#c19c00',
+    blue: '#0037da', magenta: '#881798', cyan: '#3a96dd', white: '#cccccc',
+    brightBlack: '#767676', brightRed: '#e74856', brightGreen: '#16c60c',
+    brightYellow: '#f9f1a5', brightBlue: '#3b78ff', brightMagenta: '#b4009e',
+    brightCyan: '#61d6d6', brightWhite: '#f2f2f2'
+  };
+
+  // The layout is a binary tree: leaves are terminals, splits hold two children
+  // and a draggable divider. `root` is either kind.
+  var root = null;
+  var focused = null;
+  var paneCounter = 0;
+
+  // ------------------------------------------------------------ persistence
+
+  var STORE = 'sot.layout.v1';
+
+  function serialize(n) {
+    if (n.kind === 'leaf') return { kind: 'leaf', session: n.session };
+    return { kind: 'split', dir: n.dir, ratio: n.ratio, a: serialize(n.a), b: serialize(n.b) };
+  }
+
+  function saveLayout() {
+    try {
+      localStorage.setItem(STORE, JSON.stringify({ tree: serialize(root), counter: paneCounter }));
+    } catch (e) { /* private mode or storage disabled */ }
+  }
+
+  function loadLayout() {
+    try {
+      var raw = localStorage.getItem(STORE);
+      if (!raw) return null;
+      var saved = JSON.parse(raw);
+      paneCounter = saved.counter || 0;
+      return saved.tree;
+    } catch (e) { return null; }
+  }
+
+  function build(spec) {
+    if (!spec || spec.kind === 'leaf') return makeLeaf(spec ? spec.session : rootSession);
+    var node = makeSplit(spec.dir, build(spec.a), build(spec.b));
+    if (typeof spec.ratio === 'number') node.ratio = spec.ratio;
+    return node;
+  }
+
+  // ------------------------------------------------------------------ leaf
+
+  function nextSession() {
+    paneCounter += 1;
+    return 'pane' + paneCounter;
+  }
+
+  function makeLeaf(session) {
+    var leaf = { kind: 'leaf', session: session, parent: null, ratio: 1 };
+
+    leaf.el = document.createElement('div');
+    leaf.el.className = 'pane';
+    var host = document.createElement('div');
+    host.className = 'pane-term';
+    leaf.el.appendChild(host);
+
+    var term = new Terminal({
+      cursorBlink: true,
+      fontFamily: '"Cascadia Mono", Consolas, "Courier New", monospace',
+      fontSize: fontSize,
+      scrollback: 10000,
+      // Default DOM renderer on purpose: the overlay browser is an older
+      // Chromium and WebGL there is not worth the risk.
+      theme: THEME
+    });
+    var fit = new FitAddon.FitAddon();
+    term.loadAddon(fit);
+    term.open(host);
+
+    leaf.term = term;
+    leaf.fit = fit;
+    leaf.ws = null;
+    leaf.retry = 500;
+    leaf.closed = false;
+
+    term.onData(function (d) { sendTo(leaf, { type: 'i', d: d }); });
+    term.attachCustomKeyEventHandler(function (e) { return handleKey(e, leaf); });
+
+    leaf.el.addEventListener('mousedown', function () { focus(leaf); });
+
+    // Fires on divider drags and window resizes alike, so the pty size always
+    // tracks the visible pane.
+    if (window.ResizeObserver) {
+      leaf.ro = new ResizeObserver(function () { refit(leaf); });
+      leaf.ro.observe(host);
     }
-  });
-  var fit = new FitAddon.FitAddon();
-  term.loadAddon(fit);
-  term.open(document.getElementById('term'));
-  fit.fit();
 
-  var ws = null;
-  var retry = 500;
-
-  function setStatus(text, ok) {
-    statusEl.textContent = text;
-    statusEl.className = ok ? 'ok' : 'bad';
+    connect(leaf);
+    return leaf;
   }
 
-  function send(obj) {
-    if (ws && ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify(obj));
+  function refit(leaf) {
+    if (leaf.closed) return;
+    var host = leaf.el.firstChild;
+    if (!host.clientWidth || !host.clientHeight) return;
+    try { leaf.fit.fit(); } catch (e) { return; }
+    sendTo(leaf, { type: 'r', cols: leaf.term.cols, rows: leaf.term.rows });
   }
 
-  function sendResize() {
-    fit.fit();
-    send({ type: 'r', cols: term.cols, rows: term.rows });
+  function sendTo(leaf, obj) {
+    if (leaf.ws && leaf.ws.readyState === WebSocket.OPEN) leaf.ws.send(JSON.stringify(obj));
   }
 
-  function connect() {
+  function connect(leaf) {
+    if (leaf.closed) return;
     var proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
-    var url = proto + '//' + location.host + '/ws?s=' + encodeURIComponent(session) +
+    var url = proto + '//' + location.host + '/ws?s=' + encodeURIComponent(leaf.session) +
       (token ? '&t=' + encodeURIComponent(token) : '');
-    ws = new WebSocket(url);
+    var ws = new WebSocket(url);
+    leaf.ws = ws;
 
     ws.onopen = function () {
-      retry = 500;
-      setStatus('connected', true);
+      leaf.retry = 500;
       // Clear before the server replays scrollback, so reattaching does not
       // stack a duplicate copy of the session on screen.
-      term.reset();
-      sendResize();
-      term.focus();
+      leaf.term.reset();
+      refit(leaf);
+      updateStatus();
+      if (focused === leaf) leaf.term.focus();
     };
 
     ws.onmessage = function (ev) {
       var msg;
       try { msg = JSON.parse(ev.data); } catch (e) { return; }
-      if (msg.type === 'o') term.write(msg.d);
+      if (msg.type === 'o') leaf.term.write(msg.d);
       else if (msg.type === 'exit') {
-        setStatus('shell exited (' + msg.code + ')', false);
-        term.write(CRLF + '[shell exited - reload the page to start a new one]' + CRLF);
+        leaf.term.write(CRLF + '[shell exited - close this pane or reload]' + CRLF);
       }
     };
 
     ws.onclose = function () {
-      setStatus('reconnecting...', false);
-      setTimeout(connect, retry);
-      retry = Math.min(retry * 2, 5000);
+      if (leaf.closed) return;
+      updateStatus();
+      setTimeout(function () { connect(leaf); }, leaf.retry);
+      leaf.retry = Math.min(leaf.retry * 2, 5000);
     };
 
     ws.onerror = function () { try { ws.close(); } catch (e) {} };
   }
 
-  term.onData(function (d) { send({ type: 'i', d: d }); });
-  window.addEventListener('resize', sendResize);
+  // ----------------------------------------------------------------- split
 
-  // The overlay can restore the page without firing resize; re-fit on focus.
-  window.addEventListener('focus', function () { sendResize(); term.focus(); });
-  document.addEventListener('visibilitychange', function () {
-    if (!document.hidden) { sendResize(); term.focus(); }
-  });
+  function makeSplit(dir, a, b) {
+    var node = { kind: 'split', dir: dir, a: a, b: b, parent: null, ratio: 0.5 };
+    node.el = document.createElement('div');
+    node.el.className = 'split ' + dir;
 
-  Array.prototype.forEach.call(document.querySelectorAll('#bar button'), function (btn) {
+    node.divider = document.createElement('div');
+    node.divider.className = 'divider';
+    attachDrag(node);
+
+    node.el.appendChild(a.el);
+    node.el.appendChild(node.divider);
+    node.el.appendChild(b.el);
+    a.parent = node;
+    b.parent = node;
+    applyRatio(node);
+    return node;
+  }
+
+  function applyRatio(node) {
+    node.a.el.style.flexGrow = String(node.ratio);
+    node.b.el.style.flexGrow = String(1 - node.ratio);
+    node.a.el.style.flexBasis = '0';
+    node.b.el.style.flexBasis = '0';
+  }
+
+  function attachDrag(node) {
+    function start(startEvt) {
+      startEvt.preventDefault();
+      node.divider.classList.add('dragging');
+
+      function move(e) {
+        var pt = e.touches ? e.touches[0] : e;
+        var r = node.el.getBoundingClientRect();
+        var frac = node.dir === 'row'
+          ? (pt.clientX - r.left) / r.width
+          : (pt.clientY - r.top) / r.height;
+        node.ratio = Math.min(0.9, Math.max(0.1, frac));
+        applyRatio(node);
+      }
+      function end() {
+        node.divider.classList.remove('dragging');
+        document.removeEventListener('mousemove', move);
+        document.removeEventListener('mouseup', end);
+        document.removeEventListener('touchmove', move);
+        document.removeEventListener('touchend', end);
+        saveLayout();
+      }
+      document.addEventListener('mousemove', move);
+      document.addEventListener('mouseup', end);
+      document.addEventListener('touchmove', move, { passive: false });
+      document.addEventListener('touchend', end);
+    }
+    node.divider.addEventListener('mousedown', start);
+    node.divider.addEventListener('touchstart', start, { passive: false });
+  }
+
+  // ------------------------------------------------------- tree operations
+
+  function splitFocused(dir) {
+    var leaf = focused;
+    if (!leaf) return;
+    var parent = leaf.parent;
+    var anchor = leaf.el.parentNode;
+    var placeholder = document.createComment('');
+    anchor.replaceChild(placeholder, leaf.el);
+
+    var fresh = makeLeaf(nextSession());
+    var node = makeSplit(dir, leaf, fresh);
+    node.parent = parent;
+    if (parent) { if (parent.a === leaf) parent.a = node; else parent.b = node; }
+    else root = node;
+
+    anchor.replaceChild(node.el, placeholder);
+    node.el.style.flexGrow = '1';
+    node.el.style.flexBasis = '0';
+    focus(fresh);
+    saveLayout();
+  }
+
+  function closeLeaf(leaf) {
+    if (!leaf || leaf.kind !== 'leaf') return;
+    if (!leaf.parent) { // last pane standing
+      leaf.term.write(CRLF + '[this is the only pane - split first, or reload to restart]' + CRLF);
+      return;
+    }
+    sendTo(leaf, { type: 'k' });
+    leaf.closed = true;
+    if (leaf.ro) leaf.ro.disconnect();
+    try { leaf.ws.close(); } catch (e) {}
+    try { leaf.term.dispose(); } catch (e) {}
+
+    var parent = leaf.parent;
+    var sibling = parent.a === leaf ? parent.b : parent.a;
+    var grand = parent.parent;
+
+    parent.el.parentNode.replaceChild(sibling.el, parent.el);
+    sibling.parent = grand;
+    sibling.el.style.flexGrow = '1';
+    sibling.el.style.flexBasis = '0';
+    if (grand) { if (grand.a === parent) grand.a = sibling; else grand.b = sibling; }
+    else root = sibling;
+
+    focus(firstLeaf(sibling));
+    saveLayout();
+  }
+
+  function firstLeaf(n) { return n.kind === 'leaf' ? n : firstLeaf(n.a); }
+
+  function allLeaves(n, acc) {
+    acc = acc || [];
+    if (n.kind === 'leaf') acc.push(n); else { allLeaves(n.a, acc); allLeaves(n.b, acc); }
+    return acc;
+  }
+
+  function focus(leaf) {
+    if (!leaf) return;
+    focused = leaf;
+    allLeaves(root).forEach(function (l) {
+      l.el.classList.toggle('focused', l === leaf);
+    });
+    leaf.term.focus();
+    updateStatus();
+  }
+
+  // Geometric focus movement: pick the nearest pane centre in the given
+  // direction, which behaves sanely for any tree shape.
+  function moveFocus(dx, dy) {
+    if (!focused) return;
+    var from = focused.el.getBoundingClientRect();
+    var fx = from.left + from.width / 2, fy = from.top + from.height / 2;
+    var best = null, bestDist = Infinity;
+    allLeaves(root).forEach(function (l) {
+      if (l === focused) return;
+      var r = l.el.getBoundingClientRect();
+      var cx = r.left + r.width / 2, cy = r.top + r.height / 2;
+      if (dx && Math.sign(cx - fx) !== Math.sign(dx)) return;
+      if (dy && Math.sign(cy - fy) !== Math.sign(dy)) return;
+      var d = Math.abs(cx - fx) + Math.abs(cy - fy);
+      if (d < bestDist) { bestDist = d; best = l; }
+    });
+    if (best) focus(best);
+  }
+
+  function updateStatus() {
+    var leaves = allLeaves(root);
+    var live = leaves.filter(function (l) { return l.ws && l.ws.readyState === WebSocket.OPEN; }).length;
+    var ok = live === leaves.length;
+    statusEl.textContent = (focused ? focused.session + '  ' : '') +
+      (ok ? leaves.length + ' pane' + (leaves.length === 1 ? '' : 's') : 'reconnecting ' + live + '/' + leaves.length);
+    statusEl.className = ok ? 'ok' : 'bad';
+  }
+
+  // -------------------------------------------------------------- keyboard
+
+  function handleKey(e, leaf) {
+    if (e.type !== 'keydown') return true;
+
+    if (e.altKey && e.shiftKey && !e.ctrlKey) {
+      if (e.key === '+' || e.key === '=') { splitFocused('row'); return false; }
+      if (e.key === '_' || e.key === '-') { splitFocused('col'); return false; }
+    }
+    if (e.ctrlKey && e.shiftKey && (e.key === 'W' || e.key === 'w')) {
+      closeLeaf(leaf); return false;
+    }
+    if (e.altKey && !e.ctrlKey && !e.shiftKey) {
+      if (e.key === 'ArrowLeft') { moveFocus(-1, 0); return false; }
+      if (e.key === 'ArrowRight') { moveFocus(1, 0); return false; }
+      if (e.key === 'ArrowUp') { moveFocus(0, -1); return false; }
+      if (e.key === 'ArrowDown') { moveFocus(0, 1); return false; }
+    }
+    return true;
+  }
+
+  // ------------------------------------------------------------- bootstrap
+
+  root = build(loadLayout());
+  panesEl.appendChild(root.el);
+  focus(firstLeaf(root));
+  saveLayout();
+
+  document.getElementById('split-row').addEventListener('click', function () { splitFocused('row'); });
+  document.getElementById('split-col').addEventListener('click', function () { splitFocused('col'); });
+  document.getElementById('close-pane').addEventListener('click', function () { closeLeaf(focused); });
+
+  Array.prototype.forEach.call(document.querySelectorAll('#bar button[data-key]'), function (btn) {
     btn.addEventListener('click', function (e) {
       e.preventDefault();
-      send({ type: 'i', d: KEYS[btn.getAttribute('data-key')] });
-      term.focus();
+      if (focused) sendTo(focused, { type: 'i', d: KEYS[btn.getAttribute('data-key')] });
+      if (focused) focused.term.focus();
     });
   });
 
-  connect();
+  function refitAll() { allLeaves(root).forEach(refit); }
+  window.addEventListener('resize', refitAll);
+  window.addEventListener('focus', function () { refitAll(); if (focused) focused.term.focus(); });
+  document.addEventListener('visibilitychange', function () {
+    if (!document.hidden) { refitAll(); if (focused) focused.term.focus(); }
+  });
+  setInterval(updateStatus, 2000);
 })();
 </script>
 </body>
