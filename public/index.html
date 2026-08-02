@@ -1,0 +1,164 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>PowerShell</title>
+<link rel="stylesheet" href="/vendor/xterm.css">
+<style>
+  html, body {
+    margin: 0; padding: 0; height: 100%; overflow: hidden;
+    background: #0c0c0c; color: #ccc;
+    font-family: "Cascadia Mono", Consolas, monospace;
+  }
+  #app { display: flex; flex-direction: column; height: 100%; }
+  #term { flex: 1 1 auto; min-height: 0; padding: 4px 6px; }
+  #bar {
+    flex: 0 0 auto; display: flex; gap: 4px; align-items: center;
+    padding: 4px 6px; background: #171717; border-top: 1px solid #2a2a2a;
+    font-size: 12px; overflow-x: auto; white-space: nowrap;
+  }
+  #bar button {
+    background: #262626; color: #ddd; border: 1px solid #3a3a3a; border-radius: 4px;
+    padding: 5px 9px; font: inherit; cursor: pointer; flex: 0 0 auto;
+  }
+  #bar button:hover { background: #333; }
+  #bar button:active { background: #444; }
+  #status { margin-left: auto; padding-left: 10px; flex: 0 0 auto; }
+  .ok { color: #4ec9b0; }
+  .bad { color: #f48771; }
+</style>
+</head>
+<body>
+<div id="app">
+  <div id="term"></div>
+  <div id="bar">
+    <!-- Steam's overlay swallows Shift+Tab, and phones have no Esc key, so the
+         keys that matter most for a TUI get clickable equivalents. -->
+    <button data-key="esc">Esc</button>
+    <button data-key="tab">Tab</button>
+    <button data-key="shifttab">Shift+Tab</button>
+    <button data-key="ctrlc">Ctrl+C</button>
+    <button data-key="up">&uarr;</button>
+    <button data-key="down">&darr;</button>
+    <button data-key="enter">Enter</button>
+    <span id="status" class="bad">connecting...</span>
+  </div>
+</div>
+
+<script src="/vendor/xterm.js"></script>
+<script src="/vendor/addon-fit.js"></script>
+<script>
+(function () {
+  var ESC = String.fromCharCode(27);
+  var CRLF = String.fromCharCode(13, 10);
+  var KEYS = {
+    esc: ESC,
+    tab: String.fromCharCode(9),
+    shifttab: ESC + '[Z',
+    ctrlc: String.fromCharCode(3),
+    up: ESC + '[A',
+    down: ESC + '[B',
+    enter: String.fromCharCode(13)
+  };
+
+  var params = new URLSearchParams(location.search);
+  var token = params.get('t') || '';
+  var session = params.get('s') || 'main';
+  var statusEl = document.getElementById('status');
+
+  var term = new Terminal({
+    cursorBlink: true,
+    fontFamily: '"Cascadia Mono", Consolas, "Courier New", monospace',
+    fontSize: Number(params.get('fontSize')) || 14,
+    scrollback: 10000,
+    // Default DOM renderer on purpose: the overlay browser is an older
+    // Chromium and WebGL there is not worth the risk.
+    theme: {
+      background: '#0c0c0c', foreground: '#cccccc', cursor: '#ffffff',
+      black: '#0c0c0c', red: '#c50f1f', green: '#13a10e', yellow: '#c19c00',
+      blue: '#0037da', magenta: '#881798', cyan: '#3a96dd', white: '#cccccc',
+      brightBlack: '#767676', brightRed: '#e74856', brightGreen: '#16c60c',
+      brightYellow: '#f9f1a5', brightBlue: '#3b78ff', brightMagenta: '#b4009e',
+      brightCyan: '#61d6d6', brightWhite: '#f2f2f2'
+    }
+  });
+  var fit = new FitAddon.FitAddon();
+  term.loadAddon(fit);
+  term.open(document.getElementById('term'));
+  fit.fit();
+
+  var ws = null;
+  var retry = 500;
+
+  function setStatus(text, ok) {
+    statusEl.textContent = text;
+    statusEl.className = ok ? 'ok' : 'bad';
+  }
+
+  function send(obj) {
+    if (ws && ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify(obj));
+  }
+
+  function sendResize() {
+    fit.fit();
+    send({ type: 'r', cols: term.cols, rows: term.rows });
+  }
+
+  function connect() {
+    var proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
+    var url = proto + '//' + location.host + '/ws?s=' + encodeURIComponent(session) +
+      (token ? '&t=' + encodeURIComponent(token) : '');
+    ws = new WebSocket(url);
+
+    ws.onopen = function () {
+      retry = 500;
+      setStatus('connected', true);
+      // Clear before the server replays scrollback, so reattaching does not
+      // stack a duplicate copy of the session on screen.
+      term.reset();
+      sendResize();
+      term.focus();
+    };
+
+    ws.onmessage = function (ev) {
+      var msg;
+      try { msg = JSON.parse(ev.data); } catch (e) { return; }
+      if (msg.type === 'o') term.write(msg.d);
+      else if (msg.type === 'exit') {
+        setStatus('shell exited (' + msg.code + ')', false);
+        term.write(CRLF + '[shell exited - reload the page to start a new one]' + CRLF);
+      }
+    };
+
+    ws.onclose = function () {
+      setStatus('reconnecting...', false);
+      setTimeout(connect, retry);
+      retry = Math.min(retry * 2, 5000);
+    };
+
+    ws.onerror = function () { try { ws.close(); } catch (e) {} };
+  }
+
+  term.onData(function (d) { send({ type: 'i', d: d }); });
+  window.addEventListener('resize', sendResize);
+
+  // The overlay can restore the page without firing resize; re-fit on focus.
+  window.addEventListener('focus', function () { sendResize(); term.focus(); });
+  document.addEventListener('visibilitychange', function () {
+    if (!document.hidden) { sendResize(); term.focus(); }
+  });
+
+  Array.prototype.forEach.call(document.querySelectorAll('#bar button'), function (btn) {
+    btn.addEventListener('click', function (e) {
+      e.preventDefault();
+      send({ type: 'i', d: KEYS[btn.getAttribute('data-key')] });
+      term.focus();
+    });
+  });
+
+  connect();
+})();
+</script>
+</body>
+</html>

@@ -1,0 +1,17 @@
+{
+  "name": "steam-overlay-terminal",
+  "version": "1.0.0",
+  "private": true,
+  "description": "PowerShell in a browser tab, so it can be opened inside the Steam in-game overlay",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js",
+    "lan": "node server.js --lan"
+  },
+  "dependencies": {
+    "@xterm/addon-fit": "^0.10.0",
+    "@xterm/xterm": "^5.5.0",
+    "node-pty": "^1.1.0",
+    "ws": "^8.18.0"
+  }
+}
