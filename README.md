@@ -1,11 +1,10 @@
 # steam-overlay-terminal — PowerShell in the Steam in-game overlay
 
-Run PowerShell, and Claude Code with it, inside the Steam overlay instead of alt-tabbing
+Run PowerShell, and Claude Code (or any coding CLI) with it, inside the Steam overlay instead of alt-tabbing
 out of your game. It's a real Windows ConPTY session served as a local web page, so
 Shift+Tab gets you a shell rather than a browser you didn't want.
 
-Steam has no API for putting an arbitrary Windows window into the overlay. Its built-in
-Chromium browser is the only in-game surface you get, so the terminal has to be a web page.
+Built because I am often multitasking playing CS2 and programming. This makes it easier to interface with since its in your steam overlay. 
 
 ![Three PowerShell panes and a Claude Code session running in the Steam in-game overlay during Counter-Strike 2](docs/overlay.png)
 
@@ -49,7 +48,7 @@ It prints the URL, usually `http://127.0.0.1:7681/`.
 
 **3. Point Steam at it.** Two settings, both one-time:
 
-- Steam → Settings → In Game → Overlay shortcut keys. Move the overlay off Shift+Tab.
+- OPTIONAL: Steam → Settings → In Game → Overlay shortcut keys. Move the overlay off Shift+Tab.
   Claude Code uses Shift+Tab to cycle permission modes, so the default binding is
   guaranteed to collide. Ctrl+Shift+O works.
 - Steam → Settings → Web Browser → Web browser home page. Paste the URL from step 2, and
@@ -57,7 +56,7 @@ It prints the URL, usually `http://127.0.0.1:7681/`.
 
 Check the game's Properties → General → *Enable the Steam Overlay while in-game* too.
 
-**4. Use it.** Launch a game, hit your overlay key, click into the terminal, run `claude`.
+**4. Use it.** Launch a game, hit your overlay key, and paste in the URL.
 Closing the overlay doesn't kill anything, so reopening puts you back where you were.
 
 ## Split panes, like Windows Terminal
