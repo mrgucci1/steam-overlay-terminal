@@ -46,12 +46,7 @@ const opts = parseArgs(process.argv.slice(2));
 function resolveShell() {
   if (opts.shell) return opts.shell;
   const dirs = (process.env.PATH || '').split(path.delimiter);
-  for (const d of dirs) {
-    try {
-      if (fs.existsSync(path.join(d, 'pwsh.exe'))) return 'pwsh.exe';
-    } catch { /* unreadable PATH entry */ }
-  }
-  return 'powershell.exe';
+  return dirs.some((d) => fs.existsSync(path.join(d, 'pwsh.exe'))) ? 'pwsh.exe' : 'powershell.exe';
 }
 
 const SHELL = resolveShell();
@@ -73,13 +68,8 @@ if (opts.lan) {
   }
 }
 
-function authorized(reqUrl) {
-  if (!TOKEN) return true;
-  try {
-    return new URL(reqUrl, 'http://x').searchParams.get('t') === TOKEN;
-  } catch {
-    return false;
-  }
+function authorized(url) {
+  return !TOKEN || url.searchParams.get('t') === TOKEN;
 }
 
 // ------------------------------------------------------------- sessions
@@ -88,9 +78,17 @@ const SCROLLBACK_LIMIT = 512 * 1024; // chars of replay kept per session
 
 const sessions = new Map();
 
+// One serialization for all attached clients, rather than one per client.
+function broadcast(s, msg) {
+  const frame = JSON.stringify(msg);
+  for (const ws of s.clients) {
+    if (ws.readyState === ws.OPEN) ws.send(frame);
+  }
+}
+
 function getSession(name) {
-  let s = sessions.get(name);
-  if (s && !s.dead) return s;
+  const existing = sessions.get(name);
+  if (existing) return existing;
 
   const proc = pty.spawn(SHELL, [], {
     name: 'xterm-256color',
@@ -101,24 +99,26 @@ function getSession(name) {
     useConpty: true,
   });
 
-  s = { name, proc, buffer: '', clients: new Set(), dead: false };
+  // Scrollback is kept as a chunk list so trimming is O(chunk) rather than
+  // recopying the whole cap on every write - a redrawing TUI writes constantly.
+  const s = { name, proc, chunks: [], bytes: 0, clients: new Set() };
 
   proc.onData((data) => {
-    s.buffer += data;
-    if (s.buffer.length > SCROLLBACK_LIMIT) {
-      s.buffer = s.buffer.slice(s.buffer.length - SCROLLBACK_LIMIT);
+    s.chunks.push(data);
+    s.bytes += data.length;
+    while (s.chunks.length > 1 && s.bytes - s.chunks[0].length >= SCROLLBACK_LIMIT) {
+      s.bytes -= s.chunks.shift().length;
     }
-    for (const ws of s.clients) {
-      if (ws.readyState === ws.OPEN) ws.send(JSON.stringify({ type: 'o', d: data }));
-    }
+    broadcast(s, { type: 'o', d: data });
   });
 
   proc.onExit(({ exitCode }) => {
-    s.dead = true;
     sessions.delete(name);
-    for (const ws of s.clients) {
-      if (ws.readyState === ws.OPEN) ws.send(JSON.stringify({ type: 'exit', code: exitCode }));
-    }
+    broadcast(s, { type: 'exit', code: exitCode });
+    // Otherwise the scrollback stays reachable through every attached socket's
+    // handler closure for as long as that socket lives.
+    s.chunks = [];
+    s.bytes = 0;
   });
 
   sessions.set(name, s);
@@ -128,8 +128,16 @@ function getSession(name) {
 
 // ---------------------------------------------------------------- http
 
+// `auth` is a property of the route so that adding a route forces the decision.
+// The vendor assets stay ungated: they are inert, and gating them would break
+// the relative loads from the page.
 const STATIC = {
-  '/': { file: path.join(ROOT, 'public', 'index.html'), type: 'text/html; charset=utf-8' },
+  '/': {
+    file: path.join(ROOT, 'public', 'index.html'),
+    type: 'text/html; charset=utf-8',
+    auth: true,
+    cache: 'no-cache',
+  },
   '/vendor/xterm.js': {
     file: path.join(ROOT, 'node_modules', '@xterm', 'xterm', 'lib', 'xterm.js'),
     type: 'application/javascript; charset=utf-8',
@@ -144,11 +152,32 @@ const STATIC = {
   },
 };
 
-const server = http.createServer((req, res) => {
-  const pathname = req.url.split('?')[0];
-  const entry = STATIC[pathname];
+// The vendor bundle is ~300 KB and never changes while the process runs, so it
+// is read once and served from memory with a long-lived cache header.
+const VENDOR_CACHE = 'public, max-age=31536000, immutable';
+const cached = new Map();
 
-  if (pathname === '/favicon.ico') {
+function readStatic(entry, cb) {
+  if (entry.cache) { // never cached in memory; edit index.html and reload
+    fs.readFile(entry.file, cb);
+    return;
+  }
+  const hit = cached.get(entry.file);
+  if (hit) {
+    cb(null, hit);
+    return;
+  }
+  fs.readFile(entry.file, (err, buf) => {
+    if (!err) cached.set(entry.file, buf);
+    cb(err, buf);
+  });
+}
+
+const server = http.createServer((req, res) => {
+  const url = new URL(req.url, 'http://x');
+  const entry = STATIC[url.pathname];
+
+  if (url.pathname === '/favicon.ico') {
     res.writeHead(204).end();
     return;
   }
@@ -156,18 +185,19 @@ const server = http.createServer((req, res) => {
     res.writeHead(404).end('not found');
     return;
   }
-  // Only the entry page is gated; the vendor assets are inert and gating them
-  // would just break relative loads.
-  if (pathname === '/' && !authorized(req.url)) {
+  if (entry.auth && !authorized(url)) {
     res.writeHead(401, { 'content-type': 'text/plain' }).end('missing or bad ?t= token');
     return;
   }
-  fs.readFile(entry.file, (err, buf) => {
+  readStatic(entry, (err, buf) => {
     if (err) {
       res.writeHead(500).end('read error: ' + err.message);
       return;
     }
-    res.writeHead(200, { 'content-type': entry.type, 'cache-control': 'no-cache' }).end(buf);
+    res.writeHead(200, {
+      'content-type': entry.type,
+      'cache-control': entry.cache || VENDOR_CACHE,
+    }).end(buf);
   });
 });
 
@@ -176,21 +206,21 @@ const server = http.createServer((req, res) => {
 const wss = new WebSocketServer({ noServer: true });
 
 server.on('upgrade', (req, socket, head) => {
-  if (req.url.split('?')[0] !== '/ws' || !authorized(req.url)) {
+  const url = new URL(req.url, 'http://x');
+  if (url.pathname !== '/ws' || !authorized(url)) {
     socket.destroy();
     return;
   }
-  wss.handleUpgrade(req, socket, head, (ws) => wss.emit('connection', ws, req));
+  wss.handleUpgrade(req, socket, head, (ws) => wss.emit('connection', ws, url));
 });
 
-wss.on('connection', (ws, req) => {
-  const q = new URL(req.url, 'http://x').searchParams;
-  const s = getSession(q.get('s') || 'main');
+wss.on('connection', (ws, url) => {
+  const s = getSession(url.searchParams.get('s') || 'main');
   s.clients.add(ws);
   console.log(`[client] attached to "${s.name}" (${s.clients.size} attached)`);
 
   // Replay scrollback so a reconnect looks like you never left.
-  ws.send(JSON.stringify({ type: 'o', d: s.buffer }));
+  ws.send(JSON.stringify({ type: 'o', d: s.chunks.join('') }));
 
   ws.on('message', (raw) => {
     let msg;

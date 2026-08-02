@@ -132,7 +132,10 @@
   function build(spec) {
     if (!spec || spec.kind === 'leaf') return makeLeaf(spec ? spec.session : rootSession);
     var node = makeSplit(spec.dir, build(spec.a), build(spec.b));
-    if (typeof spec.ratio === 'number') node.ratio = spec.ratio;
+    if (typeof spec.ratio === 'number') {
+      node.ratio = spec.ratio;
+      applyRatio(node); // makeSplit already applied the default; restate it
+    }
     return node;
   }
 
@@ -144,7 +147,7 @@
   }
 
   function makeLeaf(session) {
-    var leaf = { kind: 'leaf', session: session, parent: null, ratio: 1 };
+    var leaf = { kind: 'leaf', session: session, parent: null };
 
     leaf.el = document.createElement('div');
     leaf.el.className = 'pane';
@@ -176,12 +179,10 @@
 
     leaf.el.addEventListener('mousedown', function () { focus(leaf); });
 
-    // Fires on divider drags and window resizes alike, so the pty size always
-    // tracks the visible pane.
-    if (window.ResizeObserver) {
-      leaf.ro = new ResizeObserver(function () { refit(leaf); });
-      leaf.ro.observe(host);
-    }
+    // Covers divider drags and window resizes alike, so the pty size always
+    // tracks the visible pane and no separate resize listener is needed.
+    leaf.ro = new ResizeObserver(function () { refit(leaf); });
+    leaf.ro.observe(host);
 
     connect(leaf);
     return leaf;
@@ -192,6 +193,12 @@
     var host = leaf.el.firstChild;
     if (!host.clientWidth || !host.clientHeight) return;
     try { leaf.fit.fit(); } catch (e) { return; }
+    // A drag fires this every frame, but cols/rows only change when the pane
+    // crosses a character cell. Resizing the pty forces a full TUI repaint, so
+    // only send when the size actually moved.
+    if (leaf.term.cols === leaf.sentCols && leaf.term.rows === leaf.sentRows) return;
+    leaf.sentCols = leaf.term.cols;
+    leaf.sentRows = leaf.term.rows;
     sendTo(leaf, { type: 'r', cols: leaf.term.cols, rows: leaf.term.rows });
   }
 
@@ -212,6 +219,10 @@
       // Clear before the server replays scrollback, so reattaching does not
       // stack a duplicate copy of the session on screen.
       leaf.term.reset();
+      // The pty behind a reconnect may be brand new, so forget what size we
+      // last told the server and let refit re-send it.
+      leaf.sentCols = 0;
+      leaf.sentRows = 0;
       refit(leaf);
       updateStatus();
       if (focused === leaf) leaf.term.focus();
@@ -256,21 +267,22 @@
     return node;
   }
 
+  // The only writer of flexGrow: a node's share is owned by its parent split.
   function applyRatio(node) {
     node.a.el.style.flexGrow = String(node.ratio);
     node.b.el.style.flexGrow = String(1 - node.ratio);
-    node.a.el.style.flexBasis = '0';
-    node.b.el.style.flexBasis = '0';
   }
 
   function attachDrag(node) {
     function start(startEvt) {
       startEvt.preventDefault();
       node.divider.classList.add('dragging');
+      // The container does not move during the drag, so measure it once here
+      // rather than forcing a reflow on every pointer event.
+      var r = node.el.getBoundingClientRect();
 
       function move(e) {
         var pt = e.touches ? e.touches[0] : e;
-        var r = node.el.getBoundingClientRect();
         var frac = node.dir === 'row'
           ? (pt.clientX - r.left) / r.width
           : (pt.clientY - r.top) / r.height;
@@ -296,13 +308,15 @@
 
   // ------------------------------------------------------- tree operations
 
+  // Both mutations below edit the model, re-parent one element, then let
+  // applyRatio restate the geometry from the tree - so the rendered split and
+  // the persisted ratio can never disagree.
   function splitFocused(dir) {
     var leaf = focused;
     if (!leaf) return;
     var parent = leaf.parent;
     var anchor = leaf.el.parentNode;
-    var placeholder = document.createComment('');
-    anchor.replaceChild(placeholder, leaf.el);
+    var next = leaf.el.nextSibling; // survives makeSplit moving leaf.el out
 
     var fresh = makeLeaf(nextSession());
     var node = makeSplit(dir, leaf, fresh);
@@ -310,9 +324,8 @@
     if (parent) { if (parent.a === leaf) parent.a = node; else parent.b = node; }
     else root = node;
 
-    anchor.replaceChild(node.el, placeholder);
-    node.el.style.flexGrow = '1';
-    node.el.style.flexBasis = '0';
+    anchor.insertBefore(node.el, next); // null `next` degrades to append
+    if (parent) applyRatio(parent);
     focus(fresh);
     saveLayout();
   }
@@ -320,7 +333,7 @@
   function closeLeaf(leaf) {
     if (!leaf || leaf.kind !== 'leaf') return;
     if (!leaf.parent) { // last pane standing
-      leaf.term.write(CRLF + '[this is the only pane - split first, or reload to restart]' + CRLF);
+      flashStatus('only one pane - split before closing');
       return;
     }
     sendTo(leaf, { type: 'k' });
@@ -335,10 +348,11 @@
 
     parent.el.parentNode.replaceChild(sibling.el, parent.el);
     sibling.parent = grand;
-    sibling.el.style.flexGrow = '1';
-    sibling.el.style.flexBasis = '0';
-    if (grand) { if (grand.a === parent) grand.a = sibling; else grand.b = sibling; }
-    else root = sibling;
+    sibling.el.style.flexGrow = '';
+    if (grand) {
+      if (grand.a === parent) grand.a = sibling; else grand.b = sibling;
+      applyRatio(grand); // the promoted child inherits the slot's share
+    } else root = sibling;
 
     focus(firstLeaf(sibling));
     saveLayout();
@@ -354,10 +368,10 @@
 
   function focus(leaf) {
     if (!leaf) return;
+    if (leaf === focused) { leaf.term.focus(); return; }
+    if (focused) focused.el.classList.remove('focused');
     focused = leaf;
-    allLeaves(root).forEach(function (l) {
-      l.el.classList.toggle('focused', l === leaf);
-    });
+    leaf.el.classList.add('focused');
     leaf.term.focus();
     updateStatus();
   }
@@ -381,6 +395,8 @@
     if (best) focus(best);
   }
 
+  // Driven by the socket handlers and by focus/split/close - there is no state
+  // here that can change without one of those firing.
   function updateStatus() {
     var leaves = allLeaves(root);
     var live = leaves.filter(function (l) { return l.ws && l.ws.readyState === WebSocket.OPEN; }).length;
@@ -388,6 +404,15 @@
     statusEl.textContent = (focused ? focused.session + '  ' : '') +
       (ok ? leaves.length + ' pane' + (leaves.length === 1 ? '' : 's') : 'reconnecting ' + live + '/' + leaves.length);
     statusEl.className = ok ? 'ok' : 'bad';
+  }
+
+  // App-level feedback belongs in the status bar, not written into a pty's
+  // screen where it would collide with a running TUI.
+  function flashStatus(text) {
+    statusEl.textContent = text;
+    statusEl.className = 'bad';
+    clearTimeout(flashStatus.timer);
+    flashStatus.timer = setTimeout(updateStatus, 2500);
   }
 
   // -------------------------------------------------------------- keyboard
@@ -425,18 +450,19 @@
   Array.prototype.forEach.call(document.querySelectorAll('#bar button[data-key]'), function (btn) {
     btn.addEventListener('click', function (e) {
       e.preventDefault();
-      if (focused) sendTo(focused, { type: 'i', d: KEYS[btn.getAttribute('data-key')] });
-      if (focused) focused.term.focus();
+      if (!focused) return;
+      sendTo(focused, { type: 'i', d: KEYS[btn.getAttribute('data-key')] });
+      focused.term.focus();
     });
   });
 
-  function refitAll() { allLeaves(root).forEach(refit); }
-  window.addEventListener('resize', refitAll);
-  window.addEventListener('focus', function () { refitAll(); if (focused) focused.term.focus(); });
+  // Sizing is handled by each pane's ResizeObserver; coming back from a hidden
+  // overlay only needs the keyboard pointed at the right terminal again.
+  function wake() { if (focused) focused.term.focus(); }
+  window.addEventListener('focus', wake);
   document.addEventListener('visibilitychange', function () {
-    if (!document.hidden) { refitAll(); if (focused) focused.term.focus(); }
+    if (!document.hidden) wake();
   });
-  setInterval(updateStatus, 2000);
 })();
 </script>
 </body>

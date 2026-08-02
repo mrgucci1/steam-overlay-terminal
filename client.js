@@ -37,13 +37,12 @@ const url =
   (o.token ? '&t=' + encodeURIComponent(o.token) : '');
 
 const ws = new WebSocket(url);
-let attached = false;
 
-function cleanup() {
-  if (process.stdin.isTTY) {
-    try { process.stdin.setRawMode(false); } catch (e) { /* already closed */ }
-  }
+function bye(code, message) {
+  if (process.stdin.isTTY) process.stdin.setRawMode(false);
   process.stdin.pause();
+  (code ? console.error : console.log)(message);
+  process.exit(code);
 }
 
 function sendResize() {
@@ -56,7 +55,6 @@ function sendResize() {
 }
 
 ws.on('open', () => {
-  attached = true;
   if (process.stdin.isTTY) process.stdin.setRawMode(true);
   process.stdin.resume();
   sendResize();
@@ -64,10 +62,8 @@ ws.on('open', () => {
   process.stdin.on('data', (buf) => {
     // Swallow the detach key rather than forwarding it to the shell.
     if (buf.length === 1 && buf[0] === DETACH) {
-      cleanup();
       ws.close();
-      console.log('\r\n[detached - shell still running, run client.js again to reattach]');
-      process.exit(0);
+      bye(0, '\r\n[detached - shell still running, run client.js again to reattach]');
     }
     ws.send(JSON.stringify({ type: 'i', d: buf.toString('utf8') }));
   });
@@ -79,22 +75,12 @@ ws.on('message', (raw) => {
   let msg;
   try { msg = JSON.parse(raw); } catch (e) { return; }
   if (msg.type === 'o') process.stdout.write(msg.d);
-  else if (msg.type === 'exit') {
-    cleanup();
-    console.log('\r\n[remote shell exited with code ' + msg.code + ']');
-    process.exit(0);
-  }
+  else if (msg.type === 'exit') bye(0, '\r\n[remote shell exited with code ' + msg.code + ']');
 });
 
 ws.on('error', (err) => {
-  cleanup();
-  console.error('connection failed: ' + err.message);
-  console.error('is server.js running on ' + o.host + ':' + o.port + '?');
-  process.exit(1);
+  bye(1, 'connection failed: ' + err.message +
+    '\nis server.js running on ' + o.host + ':' + o.port + '?');
 });
 
-ws.on('close', () => {
-  cleanup();
-  if (attached) console.log('\r\n[connection closed]');
-  process.exit(0);
-});
+ws.on('close', () => bye(0, '\r\n[connection closed]'));

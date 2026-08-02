@@ -131,8 +131,13 @@ node client.js --session build  # a second, independent shell
 node client.js --token <tok>    # needed when the server runs with --lan
 ```
 
-Add `?s=<name>` to the web URL to open a named session, matching
-`client.js --session <name>`.
+Web URL parameters:
+
+| Param | Meaning |
+| --- | --- |
+| `?s=<name>` | open a named session, matching `client.js --session <name>` |
+| `?fontSize=<n>` | terminal font size (default 14) — worth raising on a phone |
+| `?t=<token>` | required when the server runs with `--lan` |
 
 ---
 
