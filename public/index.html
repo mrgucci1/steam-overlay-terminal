@@ -2,7 +2,14 @@
 <html lang="en">
 <head>
 <meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<!-- interactive-widget: shrink the page when the on-screen keyboard opens, so the
+     key bar stays above it instead of being pushed off the bottom. -->
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover,
+                              interactive-widget=resizes-content">
+<meta name="theme-color" content="#171717">
+<meta name="mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
 <title>PowerShell</title>
 <link rel="stylesheet" href="/vendor/xterm.css">
 <style>
@@ -10,9 +17,21 @@
     margin: 0; padding: 0; height: 100%; overflow: hidden;
     background: #0c0c0c; color: #ccc;
     font-family: "Cascadia Mono", Consolas, monospace;
+    /* Without this a swipe that starts at the top of a pane turns into
+       pull-to-refresh, which reloads the page mid-session. */
+    overscroll-behavior: none;
+    -webkit-text-size-adjust: 100%;
   }
-  #app { display: flex; flex-direction: column; height: 100%; }
-  #panes { flex: 1 1 auto; min-height: 0; display: flex; padding: 3px; }
+  /* --app-h follows the visual viewport, so an on-screen keyboard shortens the
+     app instead of covering the bottom of it. Set in JS; 100% until then. */
+  #app { display: flex; flex-direction: column; height: var(--app-h, 100%); position: relative; }
+  #panes {
+    flex: 1 1 auto; min-height: 0; display: flex;
+    padding: 3px;
+    padding-top: calc(3px + env(safe-area-inset-top));
+    padding-left: calc(3px + env(safe-area-inset-left));
+    padding-right: calc(3px + env(safe-area-inset-right));
+  }
 
   .pane, .split { flex: 1 1 0; min-width: 0; min-height: 0; display: flex; }
   .split.row { flex-direction: row; }
@@ -20,49 +39,165 @@
 
   .pane { flex-direction: column; border: 1px solid #232323; border-radius: 3px; overflow: hidden; }
   .pane.focused { border-color: #3b78ff; }
-  .pane-term { flex: 1 1 auto; min-height: 0; padding: 2px 4px; }
+  /* Touch gestures over a pane are handled in JS (attachTouchScroll), so the
+     browser must not claim them first for scrolling or double-tap zoom. */
+  .pane-term { flex: 1 1 auto; min-height: 0; padding: 2px 4px; touch-action: none; }
 
-  .divider { flex: 0 0 6px; background: #1a1a1a; }
+  .divider { flex: 0 0 6px; background: #1a1a1a; position: relative; touch-action: none; }
   .divider:hover, .divider.dragging { background: #3b78ff; }
+  /* 6px is a mouse target. The overlay spreads the touch target into the panes
+     on either side without taking any layout space from them. */
+  .divider::before { content: ''; position: absolute; top: -7px; right: -7px; bottom: -7px; left: -7px; }
   .split.row > .divider { cursor: col-resize; }
   .split.col > .divider { cursor: row-resize; }
 
   #bar {
     flex: 0 0 auto; display: flex; gap: 4px; align-items: center;
     padding: 4px 6px; background: #171717; border-top: 1px solid #2a2a2a;
-    font-size: 12px; overflow-x: auto; white-space: nowrap;
+    font-size: 12px; white-space: nowrap;
+    padding-bottom: calc(4px + env(safe-area-inset-bottom));
+    padding-left: calc(6px + env(safe-area-inset-left));
+    padding-right: calc(6px + env(safe-area-inset-right));
   }
-  #bar button {
+  /* The keys are the only part allowed to overflow: everything else stays
+     pinned and reachable however narrow the screen gets. */
+  #keys { flex: 1 1 auto; min-width: 0; display: flex; gap: 4px; overflow-x: auto; scrollbar-width: none; }
+  #keys::-webkit-scrollbar { display: none; }
+  #tools { flex: 0 0 auto; display: flex; gap: 4px; align-items: center; }
+  #tools[hidden] { display: flex; } /* the menu button that hides it is phone-only */
+  #tools button span { display: none; }
+  #menu-btn, #keyboard { display: none; }
+  #bar button, #picker button {
     background: #262626; color: #ddd; border: 1px solid #3a3a3a; border-radius: 4px;
     padding: 5px 9px; font: inherit; cursor: pointer; flex: 0 0 auto;
+    min-height: 30px; touch-action: manipulation;
+    -webkit-tap-highlight-color: transparent; user-select: none; -webkit-user-select: none;
   }
-  #bar button:hover { background: #333; }
-  #bar button:active { background: #444; }
+  #bar button:hover, #picker button:hover { background: #333; }
+  #bar button:active, #picker button:active { background: #444; }
+  #bar button.armed { background: #3b78ff; border-color: #3b78ff; color: #fff; }
   #bar .sep { flex: 0 0 auto; width: 1px; height: 18px; background: #333; margin: 0 3px; }
-  #status { margin-left: auto; padding-left: 10px; flex: 0 0 auto; }
+  /* Never shrinks: the keys next to it scroll, so they can give up the room. */
+  #status { flex: 0 0 auto; padding-left: 6px; overflow: hidden; text-overflow: ellipsis; }
   .ok { color: #4ec9b0; }
   .bad { color: #f48771; }
+
+  /* iOS zooms the whole page when focus lands on a control whose text is under
+     16px, and xterm's hidden input inherits the terminal's font size. */
+  .xterm-helper-textarea { font-size: 16px !important; }
+
+  /* Transient app-level messages. Not in the bar, which has no room to spare on
+     a phone, and not written into a pty where they would collide with a TUI. */
+  #toast {
+    position: absolute; left: 50%; transform: translateX(-50%); z-index: 6;
+    max-width: calc(100% - 24px); padding: 7px 11px;
+    background: #1c1c1c; border: 1px solid #3a3a3a; border-radius: 4px;
+    box-shadow: 0 6px 20px rgba(0, 0, 0, .6);
+    font-size: 12px; color: #f48771; pointer-events: none;
+  }
+
+  /* Session picker: floats above the bar, anchored to it in JS so it tracks the
+     bar's height whatever the font size is. */
+  #picker {
+    position: absolute; left: 6px; z-index: 5;
+    width: 280px; max-width: calc(100% - 12px);
+    display: flex; flex-direction: column;
+    background: #1c1c1c; border: 1px solid #3a3a3a; border-radius: 4px;
+    box-shadow: 0 6px 20px rgba(0, 0, 0, .6); font-size: 12px;
+  }
+  #picker[hidden] { display: none; } /* [hidden] alone loses to display:flex */
+  #picker-list { max-height: 40vh; overflow-y: auto; }
+  .picker-row {
+    display: flex; align-items: center; gap: 6px;
+    padding: 6px 4px 6px 9px; border-bottom: 1px solid #262626;
+  }
+  .picker-row:hover { background: #2b2b2b; }
+  .picker-row .name { flex: 1 1 auto; min-width: 0; cursor: pointer; overflow: hidden;
+    text-overflow: ellipsis; white-space: nowrap; }
+  .picker-row .meta { flex: 0 0 auto; color: #767676; cursor: pointer; }
+  .picker-row.here .meta { color: #4ec9b0; }
+  .picker-row button { padding: 2px 6px; }
+  .picker-note { padding: 8px 9px; color: #767676; }
+  #picker-new { display: flex; gap: 4px; padding: 6px; border-top: 1px solid #2a2a2a; }
+  #picker-new input {
+    flex: 1 1 auto; min-width: 0; font: inherit; padding: 5px 7px;
+    background: #0c0c0c; color: #ddd; border: 1px solid #3a3a3a; border-radius: 4px;
+  }
+
+  /* Phone-sized. The bar has room for the keys or for the pane and session
+     controls, not both, so the controls move into a popup behind one button. */
+  @media (max-width: 900px) {
+    #panes { padding: 0 env(safe-area-inset-right) 0 env(safe-area-inset-left); }
+    .pane-term { padding: 1px 2px; } /* every column counts at this width */
+    #menu-btn { display: block; }
+    #bar .sep { display: none; }
+    #tools {
+      position: absolute; right: 6px; z-index: 5;
+      flex-direction: column; align-items: stretch; min-width: 160px; padding: 6px;
+      background: #1c1c1c; border: 1px solid #3a3a3a; border-radius: 4px;
+      box-shadow: 0 6px 20px rgba(0, 0, 0, .6);
+    }
+    #tools[hidden] { display: none; }
+    #tools button { text-align: left; padding: 9px 10px; }
+    #tools button span { display: inline; }
+    #status { max-width: 40%; }
+    .picker-row { padding: 10px 4px 10px 9px; }
+  }
+
+  /* Only a touch device has a keyboard that has to be summoned and sent away;
+     a mouse can put focus in a terminal by clicking it. */
+  @media (pointer: coarse) {
+    #keyboard { display: block; }
+  }
 </style>
 </head>
 <body>
 <div id="app">
   <div id="panes"></div>
   <div id="bar">
-    <!-- Steam's overlay swallows Shift+Tab, and phone keyboards have no Esc, so
-         the keys that matter most for a TUI get clickable equivalents. -->
-    <button data-key="esc">Esc</button>
-    <button data-key="tab">Tab</button>
-    <button data-key="shifttab">Shift+Tab</button>
-    <button data-key="ctrlc">Ctrl+C</button>
-    <button data-key="up">&uarr;</button>
-    <button data-key="down">&darr;</button>
-    <button data-key="enter">Enter</button>
+    <!-- Steam's overlay swallows Shift+Tab, and phone keyboards have no Esc,
+         arrows or Ctrl, so the keys that matter most for a TUI get clickable
+         equivalents. This strip scrolls sideways when it does not all fit. -->
+    <div id="keys">
+      <button data-key="esc">Esc</button>
+      <button data-key="tab">Tab</button>
+      <button data-key="shifttab">Shift+Tab</button>
+      <button id="ctrl-mod" title="Send the next key you type as Ctrl+key">Ctrl</button>
+      <button data-key="ctrlc">Ctrl+C</button>
+      <button data-key="left">&larr;</button>
+      <button data-key="up">&uarr;</button>
+      <button data-key="down">&darr;</button>
+      <button data-key="right">&rarr;</button>
+      <button data-key="enter">Enter</button>
+    </div>
     <span class="sep"></span>
-    <button id="split-row" title="Split right (Alt+Shift++)">Split &rarr;</button>
-    <button id="split-col" title="Split down (Alt+Shift+-)">Split &darr;</button>
-    <button id="close-pane" title="Close pane (Ctrl+Shift+W)">&times; Pane</button>
+    <div id="tools" hidden>
+      <!-- The spans only show in the popup, where there is room for a word and
+           two lone letters would be a puzzle. -->
+      <button id="font-down" title="Smaller text, more columns">A&minus;<span> Smaller</span></button>
+      <button id="font-up" title="Bigger text">A+<span> Bigger</span></button>
+      <button id="split-row" title="Split right (Alt+Shift++)">Split &rarr;</button>
+      <button id="split-col" title="Split down (Alt+Shift+-)">Split &darr;</button>
+      <button id="close-pane" title="Close pane (Ctrl+Shift+W)">&times; Pane</button>
+      <button id="sessions" title="Attach a pane to another running session">Sessions</button>
+      <button id="keyboard" title="Show or hide the on-screen keyboard">Keyboard</button>
+    </div>
+    <button id="menu-btn" title="Pane and session controls">&#8943;</button>
     <span id="status" class="bad">connecting...</span>
   </div>
+
+  <!-- Shells outlive every browser that watches them, so there is always a set
+       of live sessions no pane is currently showing. This lists them. -->
+  <div id="picker" hidden>
+    <div id="picker-list"></div>
+    <form id="picker-new">
+      <input id="picker-name" maxlength="40" autocomplete="off" spellcheck="false"
+             placeholder="new or named session">
+      <button type="submit">Open</button>
+    </form>
+  </div>
+
+  <div id="toast" hidden></div>
 </div>
 
 <script src="/vendor/xterm.js"></script>
@@ -78,16 +213,19 @@
     ctrlc: String.fromCharCode(3),
     up: ESC + '[A',
     down: ESC + '[B',
+    right: ESC + '[C',
+    left: ESC + '[D',
     enter: String.fromCharCode(13)
   };
 
   var params = new URLSearchParams(location.search);
   var token = params.get('t') || '';
   var rootSession = params.get('s') || 'main';
-  var fontSize = Number(params.get('fontSize')) || 14;
 
   var panesEl = document.getElementById('panes');
   var statusEl = document.getElementById('status');
+  var barEl = document.getElementById('bar');
+  var appEl = document.getElementById('app');
 
   var THEME = {
     background: '#0c0c0c', foreground: '#cccccc', cursor: '#ffffff',
@@ -103,6 +241,34 @@
   var root = null;
   var focused = null;
   var paneCounter = 0;
+
+  // -------------------------------------------------------------- font size
+  //
+  // Columns are the scarce resource on a phone: the desktop default leaves a
+  // portrait screen about 43 wide, which most TUIs wrap into soup. So small
+  // screens start smaller, and the size is adjustable and remembered - it is
+  // the one setting worth changing from the device you are sitting at.
+
+  var FONT_STORE = 'sot.font.v1';
+
+  function stored(key) {
+    try { return localStorage.getItem(key); } catch (e) { return null; }
+  }
+
+  var fontSize = Number(params.get('fontSize')) || Number(stored(FONT_STORE)) ||
+    (Math.min(screen.width, screen.height) < 500 ? 11 : 14);
+
+  function setFontSize(px) {
+    px = Math.min(24, Math.max(8, px));
+    if (px === fontSize) return;
+    fontSize = px;
+    try { localStorage.setItem(FONT_STORE, String(px)); } catch (e) { /* private mode */ }
+    allLeaves(root).forEach(function (l) { l.term.options.fontSize = px; });
+    // The renderer re-measures the character cell in response to that change;
+    // fitting before it lands would size the pty from the old cell.
+    setTimeout(function () { allLeaves(root).forEach(refit); }, 0);
+    toast(px + 'px');
+  }
 
   // ------------------------------------------------------------ persistence
 
@@ -170,14 +336,22 @@
 
     leaf.term = term;
     leaf.fit = fit;
+    leaf.screenEl = host.querySelector('.xterm-screen');
     leaf.ws = null;
     leaf.retry = 500;
     leaf.closed = false;
 
-    term.onData(function (d) { sendTo(leaf, { type: 'i', d: d }); });
+    term.onData(function (d) {
+      if (leaf.muted) return; // see connect(): scrollback is still being parsed
+      sendTo(leaf, { type: 'i', d: ctrlArmed ? asCtrl(d) : d });
+      if (ctrlArmed) armCtrl(false);
+    });
     term.attachCustomKeyEventHandler(function (e) { return handleKey(e, leaf); });
 
-    leaf.el.addEventListener('mousedown', function () { focus(leaf); });
+    // Capture, because a pane running something that tracks the mouse (Claude
+    // Code does) has xterm stop the event at the terminal before it gets here.
+    leaf.el.addEventListener('mousedown', function () { focus(leaf); }, true);
+    attachTouchScroll(leaf, host);
 
     // Covers divider drags and window resizes alike, so the pty size always
     // tracks the visible pane and no separate resize listener is needed.
@@ -186,6 +360,52 @@
 
     connect(leaf);
     return leaf;
+  }
+
+  // xterm.js only reacts to touch when the app has not asked for mouse
+  // reporting, and then only by scrolling its own scrollback - so in anything
+  // that takes over the screen (Claude Code, vim, less) a swipe does nothing at
+  // all, while a mouse wheel works fine. Feeding the swipe back in as wheel
+  // events lets xterm encode it the way that pane's app expects: a mouse report
+  // while the app tracks the mouse, arrow keys on the alternate screen, a
+  // scrollback scroll otherwise. One gesture, the same three paths a real wheel
+  // already takes.
+  function attachTouchScroll(leaf, host) {
+    var lastY = 0, carry = 0, tracking = false;
+
+    host.addEventListener('touchstart', function (e) {
+      tracking = e.touches.length === 1;
+      if (tracking) { lastY = e.touches[0].clientY; carry = 0; }
+    }, true);
+
+    host.addEventListener('touchmove', function (e) {
+      if (!tracking || e.touches.length !== 1) return;
+      // Ours is the only touch handler that should run: xterm's would scroll
+      // the viewport underneath us wherever there is a scrollback to scroll.
+      e.stopPropagation();
+
+      var touch = e.touches[0];
+      carry += lastY - touch.clientY; // same sign as a wheel: drag up, scroll down
+      lastY = touch.clientY;
+
+      // A wheel event moves one line whatever its delta carries, so emit one per
+      // line crossed rather than one big delta. That keeps the text under the
+      // finger, and the leftover pixels ride along in `carry`.
+      var cell = leaf.term.rows ? leaf.screenEl.clientHeight / leaf.term.rows : 16;
+      var lines = 0;
+      while (Math.abs(carry) >= cell && lines < 24) {
+        var dir = carry > 0 ? 1 : -1;
+        carry -= dir * cell;
+        lines++;
+        leaf.screenEl.dispatchEvent(new WheelEvent('wheel', {
+          bubbles: true, cancelable: true, deltaMode: 0, deltaY: dir * cell,
+          clientX: touch.clientX, clientY: touch.clientY
+        }));
+      }
+      // Only once the gesture has actually scrolled, so that a tap still turns
+      // into the click that focuses the pane and raises the keyboard.
+      if (lines) e.preventDefault();
+    }, { capture: true, passive: false });
   }
 
   function refit(leaf) {
@@ -214,7 +434,12 @@
     var ws = new WebSocket(url);
     leaf.ws = ws;
 
+    // Every handler below checks that it is still the pane's current socket.
+    // Attaching a pane to another session supersedes the old one, and without
+    // this an in-flight message from the session we left could land in the pane,
+    // or its close could schedule a reconnect back to it.
     ws.onopen = function () {
+      if (leaf.ws !== ws) return;
       leaf.retry = 500;
       // Clear before the server replays scrollback, so reattaching does not
       // stack a duplicate copy of the session on screen.
@@ -223,24 +448,36 @@
       // last told the server and let refit re-send it.
       leaf.sentCols = 0;
       leaf.sentRows = 0;
+      leaf.muted = false; // a replay we were dropped in the middle of is moot
       refit(leaf);
       updateStatus();
       if (focused === leaf) leaf.term.focus();
     };
 
     ws.onmessage = function (ev) {
+      if (leaf.ws !== ws) return;
       var msg;
       try { msg = JSON.parse(ev.data); } catch (e) { return; }
-      if (msg.type === 'o') leaf.term.write(msg.d);
-      else if (msg.type === 'exit') {
+      if (msg.type === 'o') {
+        // Replayed scrollback still contains the terminal queries the shell made
+        // when it started (its "what are you?" DA request, at least). Answering
+        // them a second time types the answer into whatever is running in that
+        // shell now, so stay mute until the replay has finished parsing.
+        if (msg.replay) {
+          leaf.muted = true;
+          leaf.term.write(msg.d, function () { leaf.muted = false; });
+        } else {
+          leaf.term.write(msg.d);
+        }
+      } else if (msg.type === 'exit') {
         leaf.term.write(CRLF + '[shell exited - close this pane or reload]' + CRLF);
       }
     };
 
     ws.onclose = function () {
-      if (leaf.closed) return;
+      if (leaf.closed || leaf.ws !== ws) return;
       updateStatus();
-      setTimeout(function () { connect(leaf); }, leaf.retry);
+      leaf.retryTimer = setTimeout(function () { connect(leaf); }, leaf.retry);
       leaf.retry = Math.min(leaf.retry * 2, 5000);
     };
 
@@ -311,14 +548,17 @@
   // Both mutations below edit the model, re-parent one element, then let
   // applyRatio restate the geometry from the tree - so the rendered split and
   // the persisted ratio can never disagree.
-  function splitFocused(dir) {
+  // `session` attaches the new pane to an existing shell instead of spawning
+  // one, so opening a session from the picker never leaves a stillborn pane
+  // shell behind.
+  function splitFocused(dir, session) {
     var leaf = focused;
     if (!leaf) return;
     var parent = leaf.parent;
     var anchor = leaf.el.parentNode;
     var next = leaf.el.nextSibling; // survives makeSplit moving leaf.el out
 
-    var fresh = makeLeaf(nextSession());
+    var fresh = makeLeaf(session || nextSession());
     var node = makeSplit(dir, leaf, fresh);
     node.parent = parent;
     if (parent) { if (parent.a === leaf) parent.a = node; else parent.b = node; }
@@ -333,7 +573,7 @@
   function closeLeaf(leaf) {
     if (!leaf || leaf.kind !== 'leaf') return;
     if (!leaf.parent) { // last pane standing
-      flashStatus('only one pane - split before closing');
+      toast('only one pane - split before closing');
       return;
     }
     sendTo(leaf, { type: 'k' });
@@ -406,13 +646,130 @@
     statusEl.className = ok ? 'ok' : 'bad';
   }
 
-  // App-level feedback belongs in the status bar, not written into a pty's
-  // screen where it would collide with a running TUI.
-  function flashStatus(text) {
-    statusEl.textContent = text;
-    statusEl.className = 'bad';
-    clearTimeout(flashStatus.timer);
-    flashStatus.timer = setTimeout(updateStatus, 2500);
+  // App-level feedback belongs over the page, not written into a pty's screen
+  // where it would collide with a running TUI - and not in the bar, which on a
+  // phone is too narrow to show a sentence.
+  var toastEl = document.getElementById('toast');
+
+  function toast(text) {
+    toastEl.textContent = text;
+    anchorAboveBar(toastEl);
+    toastEl.hidden = false;
+    clearTimeout(toast.timer);
+    toast.timer = setTimeout(function () { toastEl.hidden = true; }, 2200);
+  }
+
+  // Everything that floats sits just above the bar, whose height is not fixed:
+  // it follows the font size and the phone's safe area.
+  function anchorAboveBar(el) {
+    el.style.bottom = (barEl.offsetHeight + 4) + 'px';
+  }
+
+  // -------------------------------------------------------- session picker
+
+  var pickerEl = document.getElementById('picker');
+  var pickerList = document.getElementById('picker-list');
+  var pickerName = document.getElementById('picker-name');
+  var pickerBtn = document.getElementById('sessions');
+
+  function note(text) {
+    var el = document.createElement('div');
+    el.className = 'picker-note';
+    el.textContent = text;
+    pickerList.appendChild(el);
+  }
+
+  function renderPicker(list) {
+    var onScreen = {};
+    allLeaves(root).forEach(function (l) { onScreen[l.session] = true; });
+
+    pickerList.textContent = '';
+    if (!list) { note('could not reach the server'); return; }
+    if (!list.length) { note('no live sessions'); return; }
+
+    list.forEach(function (s) {
+      var here = onScreen[s.name];
+      var row = document.createElement('div');
+      row.className = 'picker-row' + (here ? ' here' : '');
+
+      var name = document.createElement('span');
+      name.className = 'name';
+      name.textContent = s.name;
+      var meta = document.createElement('span');
+      meta.className = 'meta';
+      meta.textContent = here ? 'on screen' : (s.clients ? s.clients + ' attached' : 'detached');
+
+      var split = document.createElement('button');
+      split.type = 'button';
+      split.title = 'Open in a new pane';
+      split.textContent = '+';
+      split.addEventListener('click', function (e) {
+        e.stopPropagation(); // the row's own click would open it in place
+        openSession(s.name, true);
+      });
+
+      row.appendChild(name);
+      row.appendChild(meta);
+      row.appendChild(split);
+      row.addEventListener('click', function () { openSession(s.name, false); });
+      pickerList.appendChild(row);
+    });
+  }
+
+  function refreshPicker() {
+    var url = '/sessions' + (token ? '?t=' + encodeURIComponent(token) : '');
+    fetch(url, { cache: 'no-store' })
+      .then(function (r) { return r.ok ? r.json() : null; })
+      .then(renderPicker)
+      .catch(function () { renderPicker(null); });
+  }
+
+  function openPicker() {
+    closeMenu();
+    anchorAboveBar(pickerEl);
+    pickerEl.hidden = false;
+    pickerName.value = '';
+    pickerList.textContent = '';
+    note('loading...');
+    refreshPicker();
+  }
+
+  function closePicker() {
+    if (pickerEl.hidden) return;
+    pickerEl.hidden = true;
+    if (focused) focused.term.focus();
+  }
+
+  // A session may be attached by any number of clients, but showing one twice
+  // in the same page means two panes of different sizes fighting over the pty's
+  // dimensions, so a duplicate request just moves focus instead.
+  function openSession(name, inNewPane) {
+    closePicker();
+    if (!focused) return;
+    var shown = allLeaves(root).filter(function (l) { return l.session === name; })[0];
+    if (shown) { focus(shown); return; }
+    if (inNewPane) {
+      var r = focused.el.getBoundingClientRect();
+      splitFocused(r.width > r.height ? 'row' : 'col', name);
+    } else {
+      retarget(focused, name);
+    }
+  }
+
+  // Point a live pane at a different shell. The pane's old session is only
+  // detached from, never killed - that is the whole premise of the tool.
+  function retarget(leaf, name) {
+    var old = leaf.ws;
+    leaf.session = name;
+    leaf.ws = null; // supersedes `old`, whose handlers now no-op
+    if (old) { try { old.close(); } catch (e) {} }
+    // A pane picked while it happened to be mid-backoff would otherwise get a
+    // second socket from the pending retry, and the loser would stay attached.
+    clearTimeout(leaf.retryTimer);
+    leaf.retry = 500;
+    connect(leaf);
+    saveLayout();
+    updateStatus();
   }
 
   // -------------------------------------------------------------- keyboard
@@ -436,6 +793,43 @@
     return true;
   }
 
+  // ------------------------------------------------------------- tool menu
+  //
+  // Below 900px the pane and session controls live in a popup behind one
+  // button; above it they are laid out inline in the bar and CSS keeps them
+  // shown whatever `hidden` says here.
+
+  var toolsEl = document.getElementById('tools');
+  var menuBtn = document.getElementById('menu-btn');
+
+  function openMenu() {
+    closePicker();
+    anchorAboveBar(toolsEl);
+    toolsEl.hidden = false;
+  }
+
+  function closeMenu() { toolsEl.hidden = true; }
+
+  // ---------------------------------------------------------- ctrl modifier
+  //
+  // A phone keyboard has no Ctrl key, so it gets a sticky one: arm it and the
+  // next character typed is sent as its control code instead.
+
+  var ctrlBtn = document.getElementById('ctrl-mod');
+  var ctrlArmed = false;
+
+  function armCtrl(on) {
+    ctrlArmed = on;
+    ctrlBtn.classList.toggle('armed', on);
+  }
+
+  function asCtrl(d) {
+    if (d.length !== 1) return d; // a paste, or a key that is already a sequence
+    var c = d.toUpperCase().charCodeAt(0);
+    // @ through _ is the whole of the control range; nothing else has one.
+    return c >= 64 && c < 96 ? String.fromCharCode(c - 64) : d;
+  }
+
   // ------------------------------------------------------------- bootstrap
 
   root = build(loadLayout());
@@ -446,6 +840,61 @@
   document.getElementById('split-row').addEventListener('click', function () { splitFocused('row'); });
   document.getElementById('split-col').addEventListener('click', function () { splitFocused('col'); });
   document.getElementById('close-pane').addEventListener('click', function () { closeLeaf(focused); });
+  document.getElementById('font-down').addEventListener('click', function () { setFontSize(fontSize - 1); });
+  document.getElementById('font-up').addEventListener('click', function () { setFontSize(fontSize + 1); });
+  ctrlBtn.addEventListener('click', function () { armCtrl(!ctrlArmed); });
+
+  // Focus is what summons a phone's keyboard, and blurring is the only way to
+  // send it away again on a device with no hardware Back button.
+  document.getElementById('keyboard').addEventListener('click', function () {
+    if (!focused) return;
+    if (document.activeElement === focused.term.textarea) focused.term.blur();
+    else focused.term.focus();
+  });
+
+  menuBtn.addEventListener('click', function () {
+    if (toolsEl.hidden) openMenu(); else closeMenu();
+  });
+
+  // Acting on something closes the menu behind you - except the font buttons,
+  // the one thing here you press more than once in a row.
+  toolsEl.addEventListener('click', function (e) {
+    if (e.target.tagName === 'BUTTON' && e.target.id.indexOf('font-') !== 0) closeMenu();
+  });
+
+  // Tapping a bar button must not pull focus off the terminal: on a phone that
+  // drops the keyboard, which resizes every pane on the way down and back up.
+  barEl.addEventListener('mousedown', function (e) {
+    if (e.target.tagName === 'BUTTON') e.preventDefault();
+  });
+
+  pickerBtn.addEventListener('click', function () {
+    if (pickerEl.hidden) openPicker(); else closePicker();
+  });
+
+  document.getElementById('picker-new').addEventListener('submit', function (e) {
+    e.preventDefault();
+    // An unknown name is not an error: the server spawns a shell for whatever
+    // session a socket asks for, so this doubles as "new session".
+    var name = pickerName.value.trim();
+    if (name) openSession(name, false);
+  });
+
+  // Dismiss on a click anywhere else. Each toggle button is excluded from its
+  // own popup, so its click still reads as "close" rather than closing then
+  // reopening.
+  document.addEventListener('mousedown', function (e) {
+    if (!pickerEl.hidden && !pickerEl.contains(e.target) && !pickerBtn.contains(e.target)) {
+      closePicker();
+    }
+    if (!toolsEl.contains(e.target) && !menuBtn.contains(e.target)) closeMenu();
+  });
+
+  document.addEventListener('keydown', function (e) {
+    if (e.key !== 'Escape') return;
+    if (!pickerEl.hidden) closePicker();
+    closeMenu();
+  });
 
   Array.prototype.forEach.call(document.querySelectorAll('#bar button[data-key]'), function (btn) {
     btn.addEventListener('click', function (e) {
@@ -455,6 +904,26 @@
       focused.term.focus();
     });
   });
+
+  // A phone's on-screen keyboard shrinks the visual viewport, and on iOS it
+  // does so without touching the layout viewport - so a page sized at 100%
+  // hides the key bar exactly when the key bar is what you reached for. Panes
+  // resize themselves off the height change through their ResizeObservers.
+  function fitAppHeight() {
+    var vv = window.visualViewport;
+    // Pinch-zoom also shrinks the visual viewport, and there the page should
+    // stay the size it was and let you pan around it.
+    var h = vv && vv.scale <= 1.01 ? vv.height : window.innerHeight;
+    appEl.style.setProperty('--app-h', h + 'px');
+  }
+
+  if (window.visualViewport) {
+    window.visualViewport.addEventListener('resize', fitAppHeight);
+    window.visualViewport.addEventListener('scroll', fitAppHeight);
+  }
+  window.addEventListener('orientationchange', fitAppHeight);
+  window.addEventListener('resize', fitAppHeight);
+  fitAppHeight();
 
   // Sizing is handled by each pane's ResizeObserver; coming back from a hidden
   // overlay only needs the keyboard pointed at the right terminal again.

@@ -18,8 +18,13 @@ Counter-Strike 2.*
   overlay a second view of the shell you were already using.
 - Split panes with the Windows Terminal bindings. Each pane is its own shell, and the
   layout survives a reload.
-- A clickable key bar for Esc, Tab, Shift+Tab and Ctrl+C, because Steam eats Shift+Tab and
-  phone keyboards have no Esc key.
+- A **Sessions** button that lists every shell the server has, including the ones no pane
+  is currently showing, so you can reattach to any of them without remembering names.
+- A clickable key bar for Esc, Tab, Shift+Tab, Ctrl+C, the arrows and a sticky Ctrl,
+  because Steam eats Shift+Tab and phone keyboards have none of those keys.
+- Built for a phone as well as the overlay: swipe to scroll inside a full-screen TUI,
+  adjustable text size, and a key bar that stays above the on-screen keyboard.
+  See [On a phone](#on-a-phone).
 - Several clients can attach at once: overlay, desktop, phone.
 - Loopback only unless you ask for otherwise, and it refuses connections from other web
   pages. See [Security](#security).
@@ -77,7 +82,31 @@ The layout is saved to `localStorage`. Reload the page, or let the overlay reloa
 you, and the same panes come back attached to the same live shells. Closing a pane ends
 that shell. Disconnecting never does.
 
-If the overlay intercepts one of the key bindings, use the buttons.
+If the overlay intercepts one of the key bindings, use the buttons. On a screen narrower
+than 900px they live behind **⋯** in the bottom bar.
+
+## Reopening a session
+
+Shells outlive the browsers watching them, so after you quit a game there are usually live
+sessions nothing is showing. **Sessions** in the bottom bar (under **⋯** on a phone)
+lists all of them:
+
+- Click a row to point the focused pane at that session.
+- Click **+** to open it in a new pane instead, split along the pane's longer side.
+- Type a name and press **Open** for a session that doesn't exist yet.
+
+Sessions already on screen are marked, and picking one moves focus there rather than
+showing the same shell twice — two panes of different sizes would otherwise fight over the
+pty's dimensions. Moving a pane off a session only detaches from it. Only **× Pane**
+(`Ctrl+Shift+W`) ends a shell.
+
+The same list is what you want after a `server.js` restart of your own doing, or from a
+phone that has never seen this machine's layout. It's a live view of the server, not of
+your browser, so every client sees the same sessions.
+
+One consequence of nothing being killed implicitly: split a pane and then send it to a
+different session, and the shell that split spawned keeps running, listed as *detached*.
+Attach a pane to it and close the pane to be rid of it.
 
 ## Share one shell between the overlay and Windows Terminal
 
@@ -113,6 +142,36 @@ The server also listens on your LAN IP and prints a URL like
 The token is generated once and saved to `.token` (gitignored), so the URL stays stable and
 works as a bookmark. **Anyone on your network with that token gets a shell on this machine.
 Don't port-forward it.**
+
+## On a phone
+
+The page is the same page, but a phone is not a desktop, so:
+
+**Swipe to scroll, even inside Claude Code.** A full-screen TUI takes over the alternate
+screen and asks the terminal to report the mouse, and in that state xterm.js ignores touch
+entirely — a mouse wheel works and a finger does nothing. Swipes are translated into wheel
+events instead, which each app then gets in whatever form it asked for: a mouse report to
+something tracking the mouse, arrow keys on the alternate screen, a scrollback scroll in a
+plain shell. One line of text per line of finger travel, both directions.
+
+**Text size.** **A−** and **A+** change it live for every pane and remember the choice per
+device, so the phone can sit at 11px while the desktop stays at 14px. Small screens start
+at 11px for that reason: columns are what a TUI needs, and the desktop default leaves a
+portrait phone about 43 of them.
+
+**The key bar.** The keys scroll sideways; everything else stays pinned. Below 900px wide
+the pane and session controls collapse into **⋯** so the keys keep the room. **Ctrl** is
+sticky: tap it, then type a letter, and it is sent as that control code — `Ctrl` then `d`
+is `Ctrl+D`. Tapping any bar button leaves the terminal focused, so the keyboard stays up.
+
+**The on-screen keyboard** shortens the page instead of covering the bar, and **Keyboard**
+in the **⋯** menu summons and dismisses it. Note that the keyboard costs you rows, and the
+pty is shared, so opening it reflows the shell for every other client attached to that
+session too.
+
+**Gestures that used to lose your session** are gone: no pull-to-refresh, no double-tap
+zoom over a pane. Pane dividers have a fat invisible touch target, and the safe area around
+a notch or home indicator is respected.
 
 ## Security
 
@@ -156,7 +215,7 @@ Web URL parameters:
 | Param | Meaning |
 | --- | --- |
 | `?s=<name>` | open a named session, matching `client.js --session <name>` |
-| `?fontSize=<n>` | terminal font size (default 14), worth raising on a phone |
+| `?fontSize=<n>` | terminal font size, overriding the remembered one (default 14, or 11 on a small screen) |
 | `?t=<token>` | required when the server runs with `--lan` |
 
 ## Troubleshooting: the overlay browser won't load the page
@@ -192,6 +251,16 @@ or not anyone is watching. Browsers connect over a WebSocket to an xterm.js page
 `client.js` connects to that same WebSocket and pipes it through your terminal's stdio in
 raw mode. Output is fanned out to every attached client and buffered for replay, so
 attaching and detaching loses nothing.
+
+`GET /sessions` returns the live session list as JSON, which is what the **Sessions**
+button reads. It is read-only on purpose: ending a shell still happens only over a
+WebSocket already attached to it, which keeps this server's mutating surface at one place.
+
+The replay frame is flagged as a replay, because it still contains whatever the shell
+asked the terminal when it started — “what are you?”, at least. A client that answered
+those a second time would be typing the answer into whatever is running in the shell now,
+which is why attaching used to leave `[?1;2c` at your prompt. Clients stay mute until the
+replay is parsed.
 
 ## License
 

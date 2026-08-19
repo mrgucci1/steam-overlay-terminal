@@ -14,6 +14,14 @@
 const WebSocket = require('ws');
 
 const DETACH = 29; // Ctrl+]
+const ESC = 27;
+
+// Replayed scrollback still contains the terminal queries the shell made when it
+// started. This terminal will answer them again, and that answer would be typed
+// into whatever is running in the shell now, so replies are ignored for a moment
+// after a replay. Only ones that look like replies: a plain keystroke in that
+// window is a keystroke.
+let quietUntil = 0;
 
 function parseArgs(argv) {
   const o = { host: '127.0.0.1', port: 7681, session: 'main', token: '' };
@@ -69,6 +77,7 @@ ws.on('open', () => {
       ws.close();
       bye(0, '\r\n[detached - shell still running, run client.js again to reattach]');
     }
+    if (buf[0] === ESC && Date.now() < quietUntil) return;
     ws.send(JSON.stringify({ type: 'i', d: buf.toString('utf8') }));
   });
 
@@ -78,7 +87,10 @@ ws.on('open', () => {
 ws.on('message', (raw) => {
   let msg;
   try { msg = JSON.parse(raw); } catch (e) { return; }
-  if (msg.type === 'o') process.stdout.write(msg.d);
+  if (msg.type === 'o') {
+    if (msg.replay) quietUntil = Date.now() + 250;
+    process.stdout.write(msg.d);
+  }
   else if (msg.type === 'exit') bye(0, '\r\n[remote shell exited with code ' + msg.code + ']');
 });
 

@@ -205,6 +205,24 @@ const STATIC = {
 
 // The vendor bundle is ~300 KB and never changes while the process runs, so it
 // is read once and served from memory with a long-lived cache header.
+// A read-only view of what is running, so the page can offer a session picker
+// instead of making you remember names. Deliberately read-only: killing a
+// session still happens only over a WebSocket already attached to it, which
+// keeps the mutating surface of this server at exactly one place.
+const DYNAMIC = {
+  '/sessions': {
+    auth: true,
+    type: 'application/json; charset=utf-8',
+    body: () =>
+      JSON.stringify(
+        [...sessions.values()]
+          .map((s) => ({ name: s.name, clients: s.clients.size }))
+          // Numeric collation so pane2 sorts before pane10.
+          .sort((a, b) => a.name.localeCompare(b.name, undefined, { numeric: true }))
+      ),
+  },
+};
+
 const VENDOR_CACHE = 'public, max-age=31536000, immutable';
 const cached = new Map();
 
@@ -234,6 +252,15 @@ const server = http.createServer((req, res) => {
   }
   if (url.pathname === '/favicon.ico') {
     res.writeHead(204).end();
+    return;
+  }
+  const dyn = DYNAMIC[url.pathname];
+  if (dyn) {
+    if (dyn.auth && !tokenOk(url)) {
+      res.writeHead(401, { 'content-type': 'text/plain' }).end('missing or bad ?t= token');
+      return;
+    }
+    res.writeHead(200, { 'content-type': dyn.type, 'cache-control': 'no-store' }).end(dyn.body());
     return;
   }
   if (!entry) {
@@ -284,8 +311,10 @@ wss.on('connection', (ws, url) => {
   s.clients.add(ws);
   console.log(`[client] attached to "${s.name}" (${s.clients.size} attached)`);
 
-  // Replay scrollback so a reconnect looks like you never left.
-  ws.send(JSON.stringify({ type: 'o', d: s.chunks.join('') }));
+  // Replay scrollback so a reconnect looks like you never left. Flagged as a
+  // replay because a terminal must not answer the queries buried in it a second
+  // time - see the client's handler.
+  ws.send(JSON.stringify({ type: 'o', d: s.chunks.join(''), replay: true }));
 
   ws.on('message', (raw) => {
     let msg;
